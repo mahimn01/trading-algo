@@ -104,6 +104,15 @@ class MarketRegimeEngine:
             if (iwm_return > 0) == (medium_return > 0):
                 breadth_score += 1
 
+        # When day_return is near zero (e.g. market just opened), use
+        # medium_return (last 20 bars spanning prior day) as a proxy for
+        # the prevailing trend.  This prevents always falling through to
+        # RANGE_BOUND at the open.
+        effective_return = day_return
+        is_early = abs(day_return) < 0.001
+        if is_early and abs(medium_return) > abs(day_return):
+            effective_return = medium_return
+
         # Now classify the regime
 
         # High volatility supersedes other regimes
@@ -111,27 +120,27 @@ class MarketRegimeEngine:
             return MarketRegime.HIGH_VOLATILITY, 0.8, f"Extreme volatility: ATR={volatility*100:.1f}%"
 
         # Strong trends
-        if day_return > 0.01 and trend_consistency > 0.6 and trend_is_up:
+        if effective_return > 0.005 and trend_consistency > 0.6 and trend_is_up:
             conf = min(0.9, 0.5 + trend_consistency * 0.4)
-            return MarketRegime.STRONG_TREND_UP, conf, f"Strong uptrend: +{day_return*100:.1f}%, consistency={trend_consistency:.0%}"
+            return MarketRegime.STRONG_TREND_UP, conf, f"Strong uptrend: +{effective_return*100:.1f}%, consistency={trend_consistency:.0%}"
 
-        if day_return < -0.01 and trend_consistency > 0.6 and not trend_is_up:
+        if effective_return < -0.005 and trend_consistency > 0.6 and not trend_is_up:
             conf = min(0.9, 0.5 + trend_consistency * 0.4)
-            return MarketRegime.STRONG_TREND_DOWN, conf, f"Strong downtrend: {day_return*100:.1f}%, consistency={trend_consistency:.0%}"
+            return MarketRegime.STRONG_TREND_DOWN, conf, f"Strong downtrend: {effective_return*100:.1f}%, consistency={trend_consistency:.0%}"
 
         # Moderate trends
-        if day_return > 0.003 and short_return > 0 and medium_return > 0:
-            return MarketRegime.TREND_UP, 0.6, f"Upward bias: +{day_return*100:.2f}%"
+        if effective_return > 0.002 and medium_return > 0:
+            return MarketRegime.TREND_UP, 0.6, f"Upward bias: +{effective_return*100:.2f}%"
 
-        if day_return < -0.003 and short_return < 0 and medium_return < 0:
-            return MarketRegime.TREND_DOWN, 0.6, f"Downward bias: {day_return*100:.2f}%"
+        if effective_return < -0.002 and medium_return < 0:
+            return MarketRegime.TREND_DOWN, 0.6, f"Downward bias: {effective_return*100:.2f}%"
 
         # Reversals
-        if day_return < -0.005 and short_return > 0.002:
-            return MarketRegime.REVERSAL_UP, 0.5, f"Potential reversal up from {day_return*100:.2f}%"
+        if effective_return < -0.003 and short_return > 0.001:
+            return MarketRegime.REVERSAL_UP, 0.5, f"Potential reversal up from {effective_return*100:.2f}%"
 
-        if day_return > 0.005 and short_return < -0.002:
-            return MarketRegime.REVERSAL_DOWN, 0.5, f"Potential reversal down from +{day_return*100:.2f}%"
+        if effective_return > 0.003 and short_return < -0.001:
+            return MarketRegime.REVERSAL_DOWN, 0.5, f"Potential reversal down from +{effective_return*100:.2f}%"
 
         # Range bound (default)
-        return MarketRegime.RANGE_BOUND, 0.7, f"Range-bound: {day_return*100:+.2f}%, low trend consistency"
+        return MarketRegime.RANGE_BOUND, 0.7, f"Range-bound: {effective_return*100:+.2f}%, low trend consistency"

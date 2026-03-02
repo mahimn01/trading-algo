@@ -43,10 +43,12 @@ class RegimeTransitionAdapter(TradingStrategy):
     """
     Wraps RegimeTransitionStrategy as a TradingStrategy.
 
-    Needs at least ~60 bars of return data per symbol before the
-    underlying HMM can be fitted and the strategy begins producing
-    signals.  After warmup it emits one signal per symbol whenever
-    the regime transition dynamics cross the configured thresholds.
+    Aggregates intraday bars into daily OHLC before passing to the
+    underlying strategy, since the HMM transition thresholds are
+    calibrated for daily data (not 5-minute bars).
+
+    Needs at least ~60 daily bars before the strategy begins producing
+    signals.
     """
 
     def __init__(
@@ -55,15 +57,24 @@ class RegimeTransitionAdapter(TradingStrategy):
         hmm_n_states: int = 3,
         hmm_retrain_frequency: int = 21,
     ):
-        self._strategy = RegimeTransitionStrategy(config)
         self._config = config or TransitionConfig()
         self._state = StrategyState.WARMING_UP
 
-        # Per-symbol price/OHLC histories
-        self._close_history: Dict[str, List[float]] = defaultdict(list)
-        self._high_history: Dict[str, List[float]] = defaultdict(list)
-        self._low_history: Dict[str, List[float]] = defaultdict(list)
-        self._bars_per_symbol: Dict[str, int] = defaultdict(int)
+        # Per-symbol strategy instances (avoids mixing transition matrices
+        # from different symbols in the shared deque)
+        self._strategies: Dict[str, RegimeTransitionStrategy] = {}
+
+        # Per-symbol DAILY aggregated histories (not 5-min bars)
+        self._daily_close: Dict[str, List[float]] = defaultdict(list)
+        self._daily_high: Dict[str, List[float]] = defaultdict(list)
+        self._daily_low: Dict[str, List[float]] = defaultdict(list)
+        self._daily_count: Dict[str, int] = defaultdict(int)
+
+        # Intraday accumulators for current day
+        self._current_day: Dict[str, object] = {}  # symbol -> date
+        self._intraday_high: Dict[str, float] = defaultdict(lambda: -np.inf)
+        self._intraday_low: Dict[str, float] = defaultdict(lambda: np.inf)
+        self._intraday_close: Dict[str, float] = {}
 
         # Per-symbol HMM models (lazily created)
         self._hmm_models: Dict[str, HiddenMarkovRegime] = {}
@@ -93,27 +104,44 @@ class RegimeTransitionAdapter(TradingStrategy):
         close: float,
         volume: float,
     ) -> None:
-        self._close_history[symbol].append(close)
-        self._high_history[symbol].append(high)
-        self._low_history[symbol].append(low)
-        self._bars_per_symbol[symbol] += 1
+        current_date = timestamp.date()
 
-        # Trim histories to a bounded length
-        max_len = self._config.regime_return_lookback + 50
-        for hist in (
-            self._close_history[symbol],
-            self._high_history[symbol],
-            self._low_history[symbol],
-        ):
-            if len(hist) > max_len:
-                del hist[: len(hist) - max_len]
+        # Aggregate intraday bars into daily OHLC
+        prev_date = self._current_day.get(symbol)
+        if prev_date is not None and current_date != prev_date:
+            # New day: flush previous day's aggregated bar
+            self._daily_close[symbol].append(self._intraday_close[symbol])
+            self._daily_high[symbol].append(self._intraday_high[symbol])
+            self._daily_low[symbol].append(self._intraday_low[symbol])
+            self._daily_count[symbol] += 1
+
+            # Trim histories to bounded length
+            max_len = self._config.regime_return_lookback + 50
+            for hist in (
+                self._daily_close[symbol],
+                self._daily_high[symbol],
+                self._daily_low[symbol],
+            ):
+                if len(hist) > max_len:
+                    del hist[: len(hist) - max_len]
+
+            # Reset intraday accumulators
+            self._intraday_high[symbol] = high
+            self._intraday_low[symbol] = low
+        else:
+            # Same day: update intraday extremes
+            self._intraday_high[symbol] = max(self._intraday_high[symbol], high)
+            self._intraday_low[symbol] = min(self._intraday_low[symbol], low)
+
+        self._intraday_close[symbol] = close
+        self._current_day[symbol] = current_date
 
         # Transition from WARMING_UP to ACTIVE once any symbol has
-        # enough history for the HMM + strategy to operate.
+        # enough daily history.
         if self._state == StrategyState.WARMING_UP:
             ready = sum(
                 1
-                for n in self._bars_per_symbol.values()
+                for n in self._daily_count.values()
                 if n >= _WARMUP_BARS
             )
             if ready >= 1:
@@ -130,20 +158,20 @@ class RegimeTransitionAdapter(TradingStrategy):
         signals: List[StrategySignal] = []
 
         for symbol in symbols:
-            close_hist = self._close_history.get(symbol)
-            if not close_hist or len(close_hist) < _WARMUP_BARS:
+            daily_closes = self._daily_close.get(symbol)
+            if not daily_closes or len(daily_closes) < _WARMUP_BARS:
                 continue
 
-            prices = np.array(close_hist, dtype=np.float64)
+            prices = np.array(daily_closes, dtype=np.float64)
             returns = simple_returns(prices)
             if len(returns) < self._config.min_regime_history:
                 continue
 
             high_prices = np.array(
-                self._high_history.get(symbol, []), dtype=np.float64
+                self._daily_high.get(symbol, []), dtype=np.float64
             )
             low_prices = np.array(
-                self._low_history.get(symbol, []), dtype=np.float64
+                self._daily_low.get(symbol, []), dtype=np.float64
             )
 
             # Lazy-create and fit HMM model
@@ -151,11 +179,12 @@ class RegimeTransitionAdapter(TradingStrategy):
             if hmm is None:
                 hmm = HiddenMarkovRegime(
                     n_states=self._hmm_n_states,
+                    n_iter=20,  # 20 EM iters (vs default 100) for speed
                     retrain_frequency=self._hmm_retrain_frequency,
                 )
                 self._hmm_models[symbol] = hmm
 
-            bar_idx = self._bars_per_symbol[symbol]
+            bar_idx = self._daily_count[symbol]
             if not hmm._is_fitted or hmm.should_retrain(bar_idx):
                 try:
                     hmm.fit(prices)
@@ -170,9 +199,15 @@ class RegimeTransitionAdapter(TradingStrategy):
             if not hmm._is_fitted:
                 continue
 
-            # Generate signal from the underlying strategy
+            # Get or create per-symbol strategy instance
+            strategy = self._strategies.get(symbol)
+            if strategy is None:
+                strategy = RegimeTransitionStrategy(self._config)
+                self._strategies[symbol] = strategy
+
+            # Generate signal from the per-symbol strategy
             try:
-                ts_signal = self._strategy.generate_signal(
+                ts_signal = strategy.generate_signal(
                     symbol=symbol,
                     prices=prices,
                     returns=returns,
@@ -235,11 +270,17 @@ class RegimeTransitionAdapter(TradingStrategy):
         return {}
 
     def reset(self) -> None:
-        self._strategy.reset()
-        self._close_history.clear()
-        self._high_history.clear()
-        self._low_history.clear()
-        self._bars_per_symbol.clear()
+        for s in self._strategies.values():
+            s.reset()
+        self._strategies.clear()
+        self._daily_close.clear()
+        self._daily_high.clear()
+        self._daily_low.clear()
+        self._daily_count.clear()
+        self._current_day.clear()
+        self._intraday_high.clear()
+        self._intraday_low.clear()
+        self._intraday_close.clear()
         self._hmm_models.clear()
         self._last_signals.clear()
         self._state = StrategyState.WARMING_UP

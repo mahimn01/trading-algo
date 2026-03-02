@@ -21,11 +21,13 @@ from __future__ import annotations
 import csv
 import json
 import logging
+import multiprocessing
 import os
 import sys
 import time
 import traceback
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, date, timedelta
 from pathlib import Path
@@ -52,15 +54,16 @@ from trading_algo.multi_strategy.backtest_runner import (
 )
 from trading_algo.multi_strategy.adapters import (
     OrchestratorStrategyAdapter,
-    ORBStrategyAdapter,
     PairsStrategyAdapter,
     MomentumStrategyAdapter,
     RegimeTransitionAdapter,
     CrossAssetDivergenceAdapter,
     FlowPressureAdapter,
-    LiquidityCycleAdapter,
 )
 from trading_algo.quant_core.data.ibkr_data_loader import load_universe_data
+from trading_algo.quant_core.strategies.pure_momentum import MomentumConfig
+from trading_algo.quant_core.strategies.regime_transition import TransitionConfig
+from trading_algo.orchestrator.config import OrchestratorConfig
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -89,11 +92,11 @@ WARMUP_DAYS = 252            # 1 year warmup excluded from metrics
 HARD_IS_END = "2022-12-31"
 HARD_OOS_START = "2023-01-01"
 
-# Combo B strategy names
+# Combo B strategy names (removed ORB and LiquidityCycles — they require
+# intraday signal generation which we don't use)
 COMBO_B_STRATEGIES = [
-    "Orchestrator", "ORB", "PairsTrading", "PureMomentum",
-    "RegimeTransition", "CrossAssetDivergence",
-    "FlowPressure", "LiquidityCycles",
+    "Orchestrator", "PairsTrading", "PureMomentum",
+    "CrossAssetDivergence", "FlowPressure",
 ]
 
 # Market regime date ranges
@@ -112,6 +115,67 @@ logging.basicConfig(
 )
 logger = logging.getLogger("10yr_backtest")
 logger.setLevel(logging.INFO)
+
+# ---------------------------------------------------------------------------
+# Shared state for parallel workers (inherited via fork, not pickled)
+# ---------------------------------------------------------------------------
+_SHARED_BAR_DATA: Optional[Dict[str, list]] = None
+_MP_CONTEXT = multiprocessing.get_context("fork")
+_MAX_WORKERS = min(8, os.cpu_count() or 4)
+
+
+def _run_single_backtest(args: tuple):
+    """
+    Worker for parallel backtest execution.
+
+    Reads bar slices from the module-level _SHARED_BAR_DATA (inherited via
+    fork -- no pickling of large data).  ``args`` carries only lightweight
+    slice indices / config.
+
+    args layout:
+        (slice_spec, strategy_names, symbols, initial_capital,
+         risk_free_rate, entropy_filter)
+
+    slice_spec is either:
+        ("index", start_idx, end_idx)          -- slice by bar index
+        ("date", start_date, end_date)         -- slice by date objects
+    """
+    slice_spec, strategy_names, symbols, initial_capital, risk_free_rate, entropy_filter = args
+    try:
+        bar_data = _SHARED_BAR_DATA
+        if bar_data is None:
+            return "ERROR: _SHARED_BAR_DATA is None in worker"
+
+        # Resolve the slice
+        if slice_spec[0] == "index":
+            _, start_idx, end_idx = slice_spec
+            bar_slices = {sym: bars[start_idx:end_idx] for sym, bars in bar_data.items()}
+        elif slice_spec[0] == "date":
+            _, start_dt, end_dt = slice_spec
+            ref_sym = max(bar_data, key=lambda s: len(bar_data[s]))
+            ref_bars = bar_data[ref_sym]
+            start_idx = _date_to_bar_index_fast(ref_bars, start_dt)
+            end_idx = min(_date_to_bar_index_fast(ref_bars, end_dt), len(ref_bars))
+            bar_slices = {sym: bars[start_idx:end_idx] for sym, bars in bar_data.items()}
+        else:
+            return f"ERROR: unknown slice_spec type: {slice_spec[0]}"
+
+        _, runner = build_controller_and_runner(
+            strategy_names, entropy_filter=entropy_filter,
+            symbols=symbols, initial_capital=initial_capital,
+        )
+        result = runner.run(bar_slices)
+        return result
+    except Exception as exc:
+        return f"ERROR: {exc}"
+
+
+def _date_to_bar_index_fast(bars: list, target_date: date) -> int:
+    """Find the first bar index at or after the target date (for workers)."""
+    for i, bar in enumerate(bars):
+        if bar.timestamp.date() >= target_date:
+            return i
+    return len(bars)
 
 
 # =========================================================================
@@ -267,15 +331,38 @@ def extract_daily_returns_from_equity(equity_curve: List[float]) -> np.ndarray:
 
 def _make_adapters(names: List[str]) -> List[Any]:
     """Instantiate adapters by canonical name, skipping failures."""
+    # Orchestrator config tuned for 5-minute bar data with daily-only signals:
+    # - ATR thresholds scaled down ~20x (daily ATR% ≈ 20× 5-min ATR%)
+    # - Lower consensus bar: at market open, intraday regime is always
+    #   RANGE_BOUND (day_return ≈ 0), so we need a lower bar to enter
+    # - Lower mean reversion z-score: 1.0 vs 1.5 to trigger in range-bound
+    orch_cfg = OrchestratorConfig(
+        min_atr_pct=0.000001,      # effectively disabled for 5-min bars
+        max_atr_pct=0.05,          # 5% (very permissive)
+        min_consensus_edges=2,     # 2 of 6-7 edges (was 4)
+        min_consensus_score=0.15,  # (was 0.5) — lower for 5-min
+        max_opposition_score=0.60, # (was 0.35) — more tolerant
+        min_directional_quality=0.35,  # (was 0.6) — more tolerant
+        max_position_pct=0.10,     # 10% max (was 3%)
+        mean_reversion_zscore=0.8, # (was 1.5) — trigger more in range-bound
+        warmup_bars=20,            # (was 30) — ready faster
+    )
     registry: Dict[str, Callable[[], Any]] = {
-        "Orchestrator": lambda: OrchestratorStrategyAdapter(),
-        "ORB": lambda: ORBStrategyAdapter(),
+        "Orchestrator": lambda: OrchestratorStrategyAdapter(config=orch_cfg),
         "PairsTrading": lambda: PairsStrategyAdapter(),
-        "PureMomentum": lambda: MomentumStrategyAdapter(),
-        "RegimeTransition": lambda: RegimeTransitionAdapter(),
+        "PureMomentum": lambda: MomentumStrategyAdapter(
+            MomentumConfig(allow_short=False),
+        ),
+        "RegimeTransition": lambda: RegimeTransitionAdapter(
+            config=TransitionConfig(
+                min_signal_strength=0.001,     # 10bps daily return minimum
+                transition_threshold=0.15,     # require meaningful transition prob
+                velocity_threshold=0.005,      # velocity ~0.001 between retrains
+                max_position=0.10,             # 10% max position (was 20%)
+            ),
+        ),
         "CrossAssetDivergence": lambda: CrossAssetDivergenceAdapter(),
         "FlowPressure": lambda: FlowPressureAdapter(),
-        "LiquidityCycles": lambda: LiquidityCycleAdapter(),
     }
     adapters: List[Any] = []
     for n in names:
@@ -303,6 +390,24 @@ def build_controller_and_runner(
     cfg = ControllerConfig(
         enable_entropy_filter=entropy_filter,
         enable_vol_management=True,
+        vol_target=0.18,
+        vol_scale_min=0.50,      # was 0.25 — less aggressive shrinkage in high-vol
+        vol_scale_max=2.0,       # cap leverage in low-vol periods
+        max_drawdown=1.0,       # Disable drawdown halt (was causing whipsaw)
+        daily_loss_limit=1.0,   # Disable daily loss halt
+        enable_regime_adaptation=False,
+        # Redistribute allocation from removed ORB (10%) and LiquidityCycles (10%)
+        # to the 6 remaining strategies
+        # Keep v4-like allocations.  The ~12% unallocated from
+        # removed RegimeTransition acts as an implicit cash buffer,
+        # reducing position sizes and drawdowns.
+        allocations={
+            "Orchestrator": StrategyAllocation(weight=0.25, max_positions=12),
+            "PairsTrading": StrategyAllocation(weight=0.15, max_positions=10),
+            "PureMomentum": StrategyAllocation(weight=0.18, max_positions=10),
+            "CrossAssetDivergence": StrategyAllocation(weight=0.13, max_positions=8),
+            "FlowPressure": StrategyAllocation(weight=0.17, max_positions=10),
+        },
     )
     controller = MultiStrategyController(cfg)
     for adapter in _make_adapters(strategy_names):
@@ -312,6 +417,9 @@ def build_controller_and_runner(
         initial_capital=initial_capital,
         symbols=symbols,
         risk_free_rate=RISK_FREE_RATE,
+        signal_interval_bars=156,  # ~hourly (78 bars/day × 11 symbols ÷ ~5.5 signals/day)
+        intraday_vol_threshold=0.15,  # only intraday signals when ann vol > 15%
+        max_gross_exposure=1.5,    # match controller's 150% limit
     )
     runner = MultiStrategyBacktestRunner(controller, bt_cfg)
     return controller, runner
@@ -422,20 +530,23 @@ def run_walk_forward(
     Rolling walk-forward: 2-year IS window, 6-month OOS step.
 
     Yields ~16 windows covering 2016-2026.
+    Uses ProcessPoolExecutor with fork context for parallelism.
     """
     ref_sym = max(bar_data, key=lambda s: len(bar_data[s]))
     total_bars = len(bar_data[ref_sym])
-
-    windows: List[WFWindowResult] = []
-    window_start = 0
-    window_idx = 0
+    ref_bars = bar_data[ref_sym]
 
     print(f"\n{'='*70}")
-    print(f"  WALK-FORWARD ANALYSIS")
+    print(f"  WALK-FORWARD ANALYSIS  (parallel, {_MAX_WORKERS} workers)")
     print(f"  IS window: ~{IS_WINDOW_DAYS} trading days ({IS_WINDOW_DAYS//252} years)")
     print(f"  OOS step:  ~{OOS_STEP_DAYS} trading days ({OOS_STEP_DAYS//252*6} months)")
     print(f"  Total bars: {total_bars:,}")
     print(f"{'='*70}")
+
+    # ── Build all window specs upfront ────────────────────────────────
+    window_specs: List[dict] = []
+    window_start = 0
+    window_idx = 0
 
     while window_start + IS_WINDOW_BARS < total_bars:
         is_s = window_start
@@ -446,59 +557,104 @@ def run_walk_forward(
         if oos_e <= oos_s:
             break
 
-        # Get date range from reference bars
-        ref_bars = bar_data[ref_sym]
         is_start_dt = ref_bars[is_s].timestamp.date() if is_s < len(ref_bars) else None
         is_end_dt = ref_bars[min(is_e - 1, len(ref_bars) - 1)].timestamp.date()
         oos_start_dt = ref_bars[min(oos_s, len(ref_bars) - 1)].timestamp.date()
         oos_end_dt = ref_bars[min(oos_e - 1, len(ref_bars) - 1)].timestamp.date()
 
-        wfr = WFWindowResult(
-            window_idx=window_idx,
-            is_start_date=is_start_dt,
-            is_end_date=is_end_dt,
-            oos_start_date=oos_start_dt,
-            oos_end_date=oos_end_dt,
-        )
-
-        t0 = time.time()
-        print(f"\n  Window {window_idx:>2}: IS [{is_start_dt} .. {is_end_dt}]  "
-              f"OOS [{oos_start_dt} .. {oos_end_dt}]  ", end="", flush=True)
-
-        try:
-            # --- IS run ---
-            _, runner_is = build_controller_and_runner(COMBO_B_STRATEGIES)
-            is_data = slice_bar_data(bar_data, is_s, is_e)
-            is_result = runner_is.run(is_data)
-            wfr.is_sharpe = is_result.sharpe_ratio
-            wfr.is_return = is_result.total_return
-
-            # --- OOS run ---
-            _, runner_oos = build_controller_and_runner(COMBO_B_STRATEGIES)
-            oos_data = slice_bar_data(bar_data, oos_s, oos_e)
-            oos_result = runner_oos.run(oos_data)
-            wfr.oos_sharpe = oos_result.sharpe_ratio
-            wfr.oos_return = oos_result.total_return
-
-            wfr.ratio = (wfr.oos_sharpe / wfr.is_sharpe
-                         if abs(wfr.is_sharpe) > 0.01 else 0.0)
-
-        except Exception as exc:
-            wfr.error = str(exc)
-            logger.warning("Walk-forward window %d failed: %s", window_idx, exc)
-            traceback.print_exc()
-
-        wfr.elapsed_sec = time.time() - t0
-        windows.append(wfr)
-
-        status = "OK" if wfr.error is None else "FAIL"
-        print(f"IS SR={wfr.is_sharpe:+.3f}  OOS SR={wfr.oos_sharpe:+.3f}  "
-              f"Ratio={wfr.ratio:.2f}  [{wfr.elapsed_sec:.1f}s] {status}")
+        window_specs.append({
+            "window_idx": window_idx,
+            "is_s": is_s, "is_e": is_e,
+            "oos_s": oos_s, "oos_e": oos_e,
+            "is_start_dt": is_start_dt, "is_end_dt": is_end_dt,
+            "oos_start_dt": oos_start_dt, "oos_end_dt": oos_end_dt,
+        })
 
         window_start += OOS_STEP_BARS
         window_idx += 1
 
-    print(f"\n  Walk-forward complete: {len(windows)} windows processed")
+    n_windows = len(window_specs)
+    print(f"  Submitting {n_windows} windows ({n_windows * 2} IS+OOS runs) ...")
+
+    # ── Submit all IS + OOS runs in parallel ──────────────────────────
+    # Each window produces two futures: (window_idx, "is"/"oos", future)
+    t_wf_start = time.time()
+
+    # Pre-build WFWindowResult shells
+    wf_results: Dict[int, WFWindowResult] = {}
+    for spec in window_specs:
+        wf_results[spec["window_idx"]] = WFWindowResult(
+            window_idx=spec["window_idx"],
+            is_start_date=spec["is_start_dt"],
+            is_end_date=spec["is_end_dt"],
+            oos_start_date=spec["oos_start_dt"],
+            oos_end_date=spec["oos_end_dt"],
+        )
+
+    common_args = (COMBO_B_STRATEGIES, TRADING_SYMBOLS, INITIAL_CAPITAL,
+                   RISK_FREE_RATE, False)
+
+    with ProcessPoolExecutor(max_workers=_MAX_WORKERS,
+                             mp_context=_MP_CONTEXT) as pool:
+        future_to_key = {}
+        for spec in window_specs:
+            widx = spec["window_idx"]
+            # IS future
+            is_args = (("index", spec["is_s"], spec["is_e"]), *common_args)
+            f_is = pool.submit(_run_single_backtest, is_args)
+            future_to_key[f_is] = (widx, "is")
+            # OOS future
+            oos_args = (("index", spec["oos_s"], spec["oos_e"]), *common_args)
+            f_oos = pool.submit(_run_single_backtest, oos_args)
+            future_to_key[f_oos] = (widx, "oos")
+
+        completed = 0
+        total_futures = len(future_to_key)
+        for future in as_completed(future_to_key):
+            widx, phase = future_to_key[future]
+            wfr = wf_results[widx]
+            completed += 1
+
+            try:
+                result = future.result()
+                if isinstance(result, str):
+                    # Error string returned from worker
+                    wfr.error = result
+                    logger.warning("WF window %d %s failed: %s", widx, phase, result)
+                else:
+                    if phase == "is":
+                        wfr.is_sharpe = result.sharpe_ratio
+                        wfr.is_return = result.total_return
+                    else:
+                        wfr.oos_sharpe = result.sharpe_ratio
+                        wfr.oos_return = result.total_return
+            except Exception as exc:
+                wfr.error = str(exc)
+                logger.warning("WF window %d %s exception: %s", widx, phase, exc)
+
+            print(f"\r  Completed {completed}/{total_futures} WF runs ...", end="", flush=True)
+
+    # ── Post-process: compute ratios, print summary ───────────────────
+    print()  # newline after progress
+    windows: List[WFWindowResult] = []
+    for spec in window_specs:
+        widx = spec["window_idx"]
+        wfr = wf_results[widx]
+        wfr.elapsed_sec = time.time() - t_wf_start  # wall-clock for whole batch
+
+        if wfr.error is None:
+            wfr.ratio = (wfr.oos_sharpe / wfr.is_sharpe
+                         if abs(wfr.is_sharpe) > 0.01 else 0.0)
+
+        status = "OK" if wfr.error is None else "FAIL"
+        print(f"  Window {widx:>2}: IS [{wfr.is_start_date} .. {wfr.is_end_date}]  "
+              f"OOS [{wfr.oos_start_date} .. {wfr.oos_end_date}]  "
+              f"IS SR={wfr.is_sharpe:+.3f}  OOS SR={wfr.oos_sharpe:+.3f}  "
+              f"Ratio={wfr.ratio:.2f}  {status}")
+        windows.append(wfr)
+
+    print(f"\n  Walk-forward complete: {len(windows)} windows processed "
+          f"({time.time() - t_wf_start:.1f}s wall-clock)")
     return windows
 
 
@@ -518,7 +674,7 @@ class HardSplitResults:
 def run_hard_split(
     bar_data: Dict[str, List[BarObject]],
 ) -> HardSplitResults:
-    """Run hard IS (2016-2022) and OOS (2023-2026) backtests."""
+    """Run hard IS (2016-2022) and OOS (2023-2026) backtests in parallel."""
     ref_sym = max(bar_data, key=lambda s: len(bar_data[s]))
     ref_bars = bar_data[ref_sym]
 
@@ -530,35 +686,53 @@ def run_hard_split(
     result.oos_date_range = (ref_bars[split_idx].timestamp.date(), ref_bars[-1].timestamp.date())
 
     print(f"\n{'='*70}")
-    print(f"  HARD IS/OOS SPLIT")
+    print(f"  HARD IS/OOS SPLIT  (parallel, 2 workers)")
     print(f"  IS:  {result.is_date_range[0]} to {result.is_date_range[1]} ({split_idx:,} bars)")
     print(f"  OOS: {result.oos_date_range[0]} to {result.oos_date_range[1]} "
           f"({len(ref_bars) - split_idx:,} bars)")
     print(f"{'='*70}")
 
-    # IS run
-    print("  Running IS backtest ...", end=" ", flush=True)
-    t0 = time.time()
-    try:
-        _, runner_is = build_controller_and_runner(COMBO_B_STRATEGIES)
-        is_data = slice_bar_data(bar_data, 0, split_idx)
-        result.is_result = runner_is.run(is_data)
-        print(f"done ({time.time() - t0:.1f}s)")
-    except Exception as exc:
-        print(f"FAILED: {exc}")
-        traceback.print_exc()
+    common_args = (COMBO_B_STRATEGIES, TRADING_SYMBOLS, INITIAL_CAPITAL,
+                   RISK_FREE_RATE, False)
 
-    # OOS run
-    print("  Running OOS backtest ...", end=" ", flush=True)
+    print("  Running IS + OOS backtests in parallel ...", end=" ", flush=True)
     t0 = time.time()
-    try:
-        _, runner_oos = build_controller_and_runner(COMBO_B_STRATEGIES)
-        oos_data = slice_bar_data(bar_data, split_idx, len(ref_bars))
-        result.oos_result = runner_oos.run(oos_data)
-        print(f"done ({time.time() - t0:.1f}s)")
-    except Exception as exc:
-        print(f"FAILED: {exc}")
-        traceback.print_exc()
+
+    is_args = (("index", 0, split_idx), *common_args)
+    oos_args = (("index", split_idx, len(ref_bars)), *common_args)
+
+    with ProcessPoolExecutor(max_workers=2, mp_context=_MP_CONTEXT) as pool:
+        f_is = pool.submit(_run_single_backtest, is_args)
+        f_oos = pool.submit(_run_single_backtest, oos_args)
+
+        try:
+            is_res = f_is.result()
+            if isinstance(is_res, str):
+                print(f"\n  IS FAILED: {is_res}")
+            else:
+                result.is_result = is_res
+        except Exception as exc:
+            print(f"\n  IS FAILED: {exc}")
+            traceback.print_exc()
+
+        try:
+            oos_res = f_oos.result()
+            if isinstance(oos_res, str):
+                print(f"\n  OOS FAILED: {oos_res}")
+            else:
+                result.oos_result = oos_res
+        except Exception as exc:
+            print(f"\n  OOS FAILED: {exc}")
+            traceback.print_exc()
+
+    elapsed = time.time() - t0
+    print(f"done ({elapsed:.1f}s)")
+    if result.is_result:
+        print(f"    IS  -- SR={result.is_result.sharpe_ratio:+.3f}  "
+              f"Ret={result.is_result.total_return*100:+.2f}%")
+    if result.oos_result:
+        print(f"    OOS -- SR={result.oos_result.sharpe_ratio:+.3f}  "
+              f"Ret={result.oos_result.total_return*100:+.2f}%")
 
     return result
 
@@ -617,55 +791,82 @@ class RegimeResult:
 def run_regime_breakdown(
     bar_data: Dict[str, List[BarObject]],
 ) -> List[RegimeResult]:
-    """Run separate backtest for each market regime."""
+    """Run separate backtest for each market regime in parallel."""
     ref_sym = max(bar_data, key=lambda s: len(bar_data[s]))
     ref_bars = bar_data[ref_sym]
 
-    results: List[RegimeResult] = []
-
     print(f"\n{'='*70}")
-    print(f"  MARKET REGIME BREAKDOWN")
+    print(f"  MARKET REGIME BREAKDOWN  (sequential)")
     print(f"{'='*70}")
 
-    for regime_name, start_dt, end_dt in REGIME_DEFINITIONS:
+    # ── Build regime specs, skipping insufficient-data regimes ────────
+    regime_specs: List[Tuple[int, str, date, date, int, int]] = []
+    skipped: List[RegimeResult] = []
+
+    for idx, (regime_name, start_dt, end_dt) in enumerate(REGIME_DEFINITIONS):
         start_idx = date_to_bar_index(ref_bars, start_dt)
         end_idx = date_to_bar_index(ref_bars, end_dt + timedelta(days=1))
         end_idx = min(end_idx, len(ref_bars))
 
-        rr = RegimeResult(name=regime_name, start_date=start_dt, end_date=end_dt)
-
         if end_idx <= start_idx or end_idx - start_idx < BARS_PER_DAY * 5:
-            rr.error = "Insufficient data"
-            results.append(rr)
+            rr = RegimeResult(name=regime_name, start_date=start_dt, end_date=end_dt,
+                              error="Insufficient data")
+            skipped.append(rr)
             print(f"  {regime_name:<35} -- insufficient data")
-            continue
+        else:
+            regime_specs.append((idx, regime_name, start_dt, end_dt, start_idx, end_idx))
+            print(f"  {regime_name:<35} bars {start_idx:>9,} .. {end_idx:>9,}  [queued]")
 
-        print(f"  {regime_name:<35} bars {start_idx:>9,} .. {end_idx:>9,}  ", end="", flush=True)
-        t0 = time.time()
+    print(f"  Submitting {len(regime_specs)} regime runs ...")
+    t_regime_start = time.time()
 
+    common_args = (COMBO_B_STRATEGIES, TRADING_SYMBOLS, INITIAL_CAPITAL,
+                   RISK_FREE_RATE, False)
+
+    # ── Submit to pool ────────────────────────────────────────────────
+    regime_results_map: Dict[int, RegimeResult] = {}
+    for rr in skipped:
+        # Find the original index for ordering
+        for orig_idx, (rn, sd, ed) in enumerate(REGIME_DEFINITIONS):
+            if rn == rr.name:
+                regime_results_map[orig_idx] = rr
+                break
+
+    # Run sequentially to avoid memory pressure from parallel intraday backtests
+    for idx_in_batch, (orig_idx, regime_name, start_dt, end_dt, start_idx, end_idx) in enumerate(regime_specs):
+        rr = RegimeResult(name=regime_name, start_date=start_dt, end_date=end_dt)
         try:
-            _, runner = build_controller_and_runner(COMBO_B_STRATEGIES)
-            regime_data = slice_bar_data(bar_data, start_idx, end_idx)
-            res = runner.run(regime_data)
-
-            rr.sharpe = res.sharpe_ratio
-            rr.total_return = res.total_return
-            rr.annualized_return = res.annualized_return
-            rr.max_drawdown = res.max_drawdown
-            rr.total_trades = res.total_trades
-            rr.volatility = res.volatility
-
+            args = (("index", start_idx, end_idx), *common_args)
+            res = _run_single_backtest(args)
+            if isinstance(res, str):
+                rr.error = res
+                logger.warning("Regime %s failed: %s", regime_name, res)
+            else:
+                rr.sharpe = res.sharpe_ratio
+                rr.total_return = res.total_return
+                rr.annualized_return = res.annualized_return
+                rr.max_drawdown = res.max_drawdown
+                rr.total_trades = res.total_trades
+                rr.volatility = res.volatility
         except Exception as exc:
             rr.error = str(exc)
-            logger.warning("Regime %s failed: %s", regime_name, exc)
+            logger.warning("Regime %s exception: %s", regime_name, exc)
 
-        elapsed = time.time() - t0
+        regime_results_map[orig_idx] = rr
+
         status = "OK" if rr.error is None else f"FAIL: {rr.error}"
-        print(f"SR={rr.sharpe:+.3f}  Ret={rr.total_return*100:+.1f}%  "
-              f"DD={rr.max_drawdown*100:.1f}%  [{elapsed:.1f}s] {status}")
+        print(f"  [{idx_in_batch+1}/{len(regime_specs)}] {regime_name:<35} "
+              f"SR={rr.sharpe:+.3f}  Ret={rr.total_return*100:+.1f}%  "
+              f"DD={rr.max_drawdown*100:.1f}%  {status}")
 
-        results.append(rr)
+    elapsed = time.time() - t_regime_start
+    print(f"  Regime breakdown complete ({elapsed:.1f}s wall-clock)")
 
+    # Return in original REGIME_DEFINITIONS order
+    results: List[RegimeResult] = []
+    for i in range(len(REGIME_DEFINITIONS)):
+        if i in regime_results_map:
+            results.append(regime_results_map[i])
     return results
 
 
@@ -1387,6 +1588,11 @@ def main() -> None:
     t0 = time.time()
     bar_data, coverage = load_bar_data()
     print(f"  Data loading took {time.time() - t0:.1f}s\n")
+
+    # Store in module-level global so forked workers can access it
+    # without pickling (copy-on-write via fork)
+    global _SHARED_BAR_DATA
+    _SHARED_BAR_DATA = bar_data
 
     # ── Step 2: Extract SPY benchmark returns ─────────────────────────
     print(f"[Step 2/7] Extracting SPY daily returns for benchmark ...")

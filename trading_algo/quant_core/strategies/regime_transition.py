@@ -144,8 +144,8 @@ class TransitionConfig:
         min_signal_strength: Minimum absolute signal strength to act on.
             Filters out noise near zero.
     """
-    transition_threshold: float = 0.25
-    velocity_threshold: float = 0.05
+    transition_threshold: float = 0.05
+    velocity_threshold: float = 0.005
     velocity_window: int = 5
     max_holding_days: int = 20
     vol_target: float = 0.15
@@ -159,7 +159,7 @@ class TransitionConfig:
     commission_bps: float = 10.0
     high_vol_position_scale: float = 0.5
     kelly_fraction: float = 0.5
-    min_signal_strength: float = 0.05
+    min_signal_strength: float = 0.0001
 
 
 # =============================================================================

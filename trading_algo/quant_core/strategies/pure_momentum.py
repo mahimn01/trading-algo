@@ -56,6 +56,11 @@ class MomentumConfig:
     trend_filter: bool = True      # Only long above 200 MA
     momentum_threshold: float = 0.0  # Min momentum to enter
 
+    # Short selling
+    allow_short: bool = False      # Enable short signals for bear markets
+    short_momentum_threshold: float = -0.10  # Min negative momentum to short
+    short_max_position: float = 0.15  # Max 15% per short position
+
     # Volatility scaling
     vol_scale: bool = True
     target_vol: float = 0.20       # 20% target volatility
@@ -164,17 +169,16 @@ class PureMomentumStrategy:
                 trend=trend,
                 momentum_score=momentum_score,
                 position_size=0.0,  # Calculated below
-                entry_price=current_price if momentum_score > 0 else None,
+                entry_price=current_price if momentum_score != 0 else None,
             )
 
-        # Rank by momentum and allocate
+        # --- Long allocation ---
         ranked = sorted(
             [(s, sig.momentum_score) for s, sig in signals.items() if sig.momentum_score > self.config.momentum_threshold],
             key=lambda x: x[1],
             reverse=True
         )
 
-        # Calculate position sizes
         total_score = sum(max(0, score) for _, score in ranked)
 
         if total_score > 0:
@@ -201,6 +205,39 @@ class PureMomentumStrategy:
 
                 signals[symbol].position_size = position
 
+        # --- Short allocation (bear market alpha) ---
+        if self.config.allow_short:
+            short_candidates = sorted(
+                [
+                    (s, sig.momentum_score)
+                    for s, sig in signals.items()
+                    if sig.momentum_score < self.config.short_momentum_threshold
+                    and sig.trend in (TrendState.DOWN, TrendState.STRONG_DOWN)
+                ],
+                key=lambda x: x[1],  # Most negative first
+            )
+
+            short_exposure = self.config.target_exposure * 0.3
+            total_neg_score = sum(abs(score) for _, score in short_candidates)
+
+            if total_neg_score > 0:
+                for symbol, score in short_candidates:
+                    base_short = (abs(score) / total_neg_score) * short_exposure
+
+                    # Volatility scaling (inverse vol)
+                    if self.config.vol_scale and symbol in volatilities:
+                        vol = volatilities[symbol]
+                        if vol > 0:
+                            vol_scalar = self.config.target_vol / vol
+                            base_short *= min(vol_scalar, 2.0)
+
+                    # Cap at short_max_position
+                    position = min(base_short, self.config.short_max_position)
+                    position = max(position, self.config.min_position)
+
+                    # Negative position_size indicates short
+                    signals[symbol].position_size = -position
+
         return signals
 
     def get_target_weights(
@@ -212,22 +249,38 @@ class PureMomentumStrategy:
         Get target portfolio weights.
 
         Returns:
-            Dict of symbol -> target weight (0 to max_position)
+            Dict of symbol -> target weight (positive for long, negative for short)
         """
         signals = self.generate_signals(symbols, prices)
 
         weights = {}
-        total_weight = 0.0
+        total_long = 0.0
+        total_short = 0.0
 
         for symbol, signal in signals.items():
             if signal.position_size > 0:
                 weights[symbol] = signal.position_size
-                total_weight += signal.position_size
+                total_long += signal.position_size
+            elif signal.position_size < 0:
+                weights[symbol] = signal.position_size  # negative
+                total_short += abs(signal.position_size)
 
-        # Normalize if over target exposure
-        if total_weight > self.config.target_exposure:
-            scale = self.config.target_exposure / total_weight
-            weights = {s: w * scale for s, w in weights.items()}
+        # Normalize longs if over target exposure
+        if total_long > self.config.target_exposure:
+            scale = self.config.target_exposure / total_long
+            weights = {
+                s: w * scale if w > 0 else w
+                for s, w in weights.items()
+            }
+
+        # Normalize shorts if over half target exposure
+        short_limit = self.config.target_exposure * 0.5
+        if total_short > short_limit:
+            scale = short_limit / total_short
+            weights = {
+                s: w * scale if w < 0 else w
+                for s, w in weights.items()
+            }
 
         return weights
 

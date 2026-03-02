@@ -263,7 +263,7 @@ class SignalAggregator:
         """
         try:
             # Fit HMM if needed
-            if not hasattr(self.hmm_model, '_fitted') or not self.hmm_model._fitted:
+            if not self.hmm_model._is_fitted:
                 self.hmm_model.fit(market_prices, market_returns, volumes)
 
             # Predict current regime

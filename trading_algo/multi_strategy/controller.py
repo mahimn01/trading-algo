@@ -59,14 +59,14 @@ class ControllerConfig:
     """
 
     allocations: Dict[str, StrategyAllocation] = field(default_factory=lambda: {
-        "Orchestrator": StrategyAllocation(weight=0.25, max_positions=8),
-        "ORB": StrategyAllocation(weight=0.08, max_positions=5),
-        "PairsTrading": StrategyAllocation(weight=0.10, max_positions=6),
+        "Orchestrator": StrategyAllocation(weight=0.20, max_positions=12),
+        "ORB": StrategyAllocation(weight=0.10, max_positions=10),
+        "PairsTrading": StrategyAllocation(weight=0.12, max_positions=10),
         "PureMomentum": StrategyAllocation(weight=0.15, max_positions=10),
-        "RegimeTransition": StrategyAllocation(weight=0.12, max_positions=5),
-        "CrossAssetDivergence": StrategyAllocation(weight=0.10, max_positions=4),
-        "FlowPressure": StrategyAllocation(weight=0.10, max_positions=6),
-        "LiquidityCycles": StrategyAllocation(weight=0.10, max_positions=5),
+        "RegimeTransition": StrategyAllocation(weight=0.10, max_positions=8),
+        "CrossAssetDivergence": StrategyAllocation(weight=0.10, max_positions=8),
+        "FlowPressure": StrategyAllocation(weight=0.13, max_positions=10),
+        "LiquidityCycles": StrategyAllocation(weight=0.10, max_positions=10),
         "LeadLagArbitrage": StrategyAllocation(weight=0.08, max_positions=4),
         "HurstAdaptive": StrategyAllocation(weight=0.08, max_positions=6),
         "TimeAdaptive": StrategyAllocation(weight=0.06, max_positions=4),
@@ -82,7 +82,7 @@ class ControllerConfig:
     max_single_symbol_weight: float = 0.20
     """Maximum total weight in any one symbol across all strategies."""
 
-    max_portfolio_positions: int = 25
+    max_portfolio_positions: int = 40
     """Maximum total concurrent positions across all strategies."""
 
     # ── Conflict resolution ─────────────────────────────────────────────
@@ -110,10 +110,10 @@ class ControllerConfig:
     enable_risk_controller: bool = True
     """When True, run quant_core RiskController before emitting signals."""
 
-    max_drawdown: float = 0.20
+    max_drawdown: float = 0.40
     """Portfolio-level max drawdown (used by risk controller)."""
 
-    daily_loss_limit: float = 0.03
+    daily_loss_limit: float = 0.05
     """Stop trading for the day if portfolio loses more than this %."""
 
     # ── Volatility management (Moreira & Muir 2017) ─────────────────────
@@ -127,6 +127,12 @@ class ControllerConfig:
 
     vol_lookback: int = 20
     """Number of daily returns for realized vol estimate."""
+
+    vol_scale_min: float = 0.25
+    """Minimum vol scalar (floor). Prevents over-shrinking in high-vol regimes."""
+
+    vol_scale_max: float = 2.0
+    """Maximum vol scalar (cap). Prevents over-leveraging in low-vol regimes."""
 
     # ── Entropy filter ────────────────────────────────────────────────
     enable_entropy_filter: bool = False
@@ -167,6 +173,8 @@ class MultiStrategyController:
         self._current_positions: Dict[str, float] = {}  # symbol -> net weight
         self._daily_pnl: float = 0.0
         self._halted: bool = False
+        self._dd_warned_today: bool = False
+        self._daily_loss_warned_today: bool = False
 
         # Per-strategy position tracking
         self._strategy_positions: Dict[str, Dict[str, float]] = defaultdict(dict)
@@ -728,10 +736,12 @@ class MultiStrategyController:
         if self._equity < self._peak_equity:
             dd = 1.0 - self._equity / self._peak_equity
             if dd >= self.config.max_drawdown:
-                logger.warning(
-                    "Max drawdown %.1f%% hit — blocking all entries",
-                    dd * 100,
-                )
+                if not self._dd_warned_today:
+                    logger.warning(
+                        "Max drawdown %.1f%% hit — blocking all entries",
+                        dd * 100,
+                    )
+                    self._dd_warned_today = True
                 return [s for s in signals if s.is_exit]
 
             # Scale down near drawdown limit
@@ -755,10 +765,12 @@ class MultiStrategyController:
 
         # Daily loss check
         if self._daily_pnl <= -self.config.daily_loss_limit:
-            logger.warning(
-                "Daily loss limit %.1f%% hit — halting entries",
-                self._daily_pnl * 100,
-            )
+            if not self._daily_loss_warned_today:
+                logger.warning(
+                    "Daily loss limit %.1f%% hit — halting entries",
+                    self._daily_pnl * 100,
+                )
+                self._daily_loss_warned_today = True
             self._halted = True
             return [s for s in signals if s.is_exit]
 
@@ -789,7 +801,10 @@ class MultiStrategyController:
         if realized_vol <= 0:
             return signals
 
-        vol_scalar = min(2.0, max(0.25, self.config.vol_target / realized_vol))
+        vol_scalar = min(
+            self.config.vol_scale_max,
+            max(self.config.vol_scale_min, self.config.vol_target / realized_vol),
+        )
 
         if abs(vol_scalar - 1.0) < 0.05:
             return signals  # No meaningful adjustment
@@ -904,6 +919,8 @@ class MultiStrategyController:
         """Reset daily counters (call at start of each trading day)."""
         self._daily_pnl = 0.0
         self._halted = False
+        self._dd_warned_today = False
+        self._daily_loss_warned_today = False
 
     def reset(self) -> None:
         """Full reset of controller and all strategies."""
@@ -914,6 +931,8 @@ class MultiStrategyController:
         self._returns.clear()
         self._daily_pnl = 0.0
         self._halted = False
+        self._dd_warned_today = False
+        self._daily_loss_warned_today = False
         self._peak_equity = self._equity
 
     # ── Helpers ─────────────────────────────────────────────────────────

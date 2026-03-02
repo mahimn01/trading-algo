@@ -30,6 +30,8 @@ References:
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 from numpy.typing import NDArray
 from dataclasses import dataclass, field
@@ -156,9 +158,10 @@ class HiddenMarkovRegime:
             from hmmlearn.hmm import GaussianHMM
             self._model = GaussianHMM(
                 n_components=self.n_states,
-                covariance_type=self.covariance_type,
+                covariance_type="diag",
                 n_iter=self.n_iter,
                 random_state=42,
+                min_covar=1e-4,
             )
         except ImportError:
             # Fallback to simple implementation
@@ -247,7 +250,9 @@ class HiddenMarkovRegime:
 
         # Fit model
         try:
-            self._model.fit(features)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                self._model.fit(features)
             self._is_fitted = True
 
             # Map states to regimes based on characteristics
@@ -485,11 +490,12 @@ class SimpleGaussianHMM:
         self.n_iter = n_iter
         self.means_ = None
         self.covars_ = None
+        self._covars_inv = None  # Precomputed inverse covariances
         self.transmat_ = None
         self.startprob_ = None
 
     def fit(self, X: NDArray) -> "SimpleGaussianHMM":
-        """Fit HMM using K-means initialisation + empirical transitions."""
+        """Fit HMM using K-means initialisation + EM refinement."""
         n_samples, n_features = X.shape
 
         # Initialize parameters using K-means-like approach
@@ -509,66 +515,92 @@ class SimpleGaussianHMM:
             cov = np.cov(chunk, rowvar=False)
             if n_features == 1:
                 cov = cov.reshape(1, 1)
-            # Regularise to avoid singular covariance
             self.covars_[i] = cov + np.eye(n_features) * 1e-6
 
-        # Compute state assignments and derive empirical transition matrix
-        states = self.predict(X)
-        self.transmat_ = np.ones((self.n_states, self.n_states)) * 1e-3  # Laplace prior
-        for t in range(1, len(states)):
-            self.transmat_[states[t - 1], states[t]] += 1.0
-        self.transmat_ /= self.transmat_.sum(axis=1, keepdims=True)
-
-        # Empirical start probabilities
+        # Initialize transition matrix with mild self-transition bias
+        self.transmat_ = np.full(
+            (self.n_states, self.n_states), 0.05 / (self.n_states - 1)
+        )
+        np.fill_diagonal(self.transmat_, 0.95)
         self.startprob_ = np.ones(self.n_states) / self.n_states
+
+        # EM refinement: re-estimate means, covariances, transitions
+        for _ in range(min(self.n_iter, 20)):
+            self._update_covars_inv(n_features)
+            responsibilities = self.predict_proba(X)  # E-step soft assignments
+
+            # M-step: update means and covariances
+            for s in range(self.n_states):
+                w = responsibilities[:, s]
+                w_sum = w.sum()
+                if w_sum < 1.0:
+                    continue
+                self.means_[s] = (w[:, None] * X).sum(axis=0) / w_sum
+                diff = X - self.means_[s]
+                self.covars_[s] = (
+                    (diff * w[:, None]).T @ diff / w_sum
+                    + np.eye(n_features) * 1e-6
+                )
+
+            # M-step: update transition matrix from hard assignments
+            states = np.argmax(responsibilities, axis=1)
+            trans_counts = np.ones((self.n_states, self.n_states)) * 0.1
+            for t in range(1, len(states)):
+                trans_counts[states[t - 1], states[t]] += 1.0
+            self.transmat_ = trans_counts / trans_counts.sum(axis=1, keepdims=True)
+
+        # Final inverse covariance precompute
+        self._update_covars_inv(n_features)
+
+        # Final state assignments for start probabilities
+        states = self.predict(X)
+        counts = np.bincount(states, minlength=self.n_states).astype(float) + 0.1
+        self.startprob_ = counts / counts.sum()
 
         return self
 
+    def _update_covars_inv(self, n_features: int) -> None:
+        """Precompute inverse covariance matrices."""
+        self._covars_inv = np.zeros_like(self.covars_)
+        for i in range(self.n_states):
+            try:
+                self._covars_inv[i] = np.linalg.inv(self.covars_[i])
+            except np.linalg.LinAlgError:
+                self._covars_inv[i] = np.eye(n_features)
+
     def predict(self, X: NDArray) -> NDArray:
-        """Predict most likely states."""
+        """Predict most likely states using precomputed inverse covariances."""
         if self.means_ is None:
             return np.zeros(len(X), dtype=int)
 
-        # Simple argmax over Gaussian likelihoods
         n_samples = len(X)
-        states = np.zeros(n_samples, dtype=int)
+        # Vectorized: compute Mahalanobis distance for all samples and states
+        # likelihoods[t, s] = exp(-0.5 * (X[t]-mu_s) @ inv(cov_s) @ (X[t]-mu_s))
+        log_likelihoods = np.zeros((n_samples, self.n_states))
+        for s in range(self.n_states):
+            diff = X - self.means_[s]  # (n_samples, n_features)
+            cov_inv = self._covars_inv[s] if self._covars_inv is not None else np.eye(X.shape[1])
+            # Batch Mahalanobis: (diff @ cov_inv) * diff, summed over features
+            log_likelihoods[:, s] = -0.5 * np.sum(diff @ cov_inv * diff, axis=1)
 
-        for t in range(n_samples):
-            likelihoods = np.zeros(self.n_states)
-            for s in range(self.n_states):
-                diff = X[t] - self.means_[s]
-                try:
-                    cov_inv = np.linalg.inv(self.covars_[s])
-                    likelihoods[s] = np.exp(-0.5 * diff @ cov_inv @ diff)
-                except:
-                    likelihoods[s] = np.exp(-0.5 * np.sum(diff**2))
-
-            states[t] = np.argmax(likelihoods)
-
-        return states
+        return np.argmax(log_likelihoods, axis=1).astype(int)
 
     def predict_proba(self, X: NDArray) -> NDArray:
-        """Predict state probabilities."""
+        """Predict state probabilities using precomputed inverse covariances."""
         if self.means_ is None:
             return np.ones((len(X), self.n_states)) / self.n_states
 
         n_samples = len(X)
-        probs = np.zeros((n_samples, self.n_states))
+        log_probs = np.zeros((n_samples, self.n_states))
+        for s in range(self.n_states):
+            diff = X - self.means_[s]
+            cov_inv = self._covars_inv[s] if self._covars_inv is not None else np.eye(X.shape[1])
+            log_probs[:, s] = -0.5 * np.sum(diff @ cov_inv * diff, axis=1)
 
-        for t in range(n_samples):
-            for s in range(self.n_states):
-                diff = X[t] - self.means_[s]
-                try:
-                    cov_inv = np.linalg.inv(self.covars_[s])
-                    probs[t, s] = np.exp(-0.5 * diff @ cov_inv @ diff)
-                except:
-                    probs[t, s] = np.exp(-0.5 * np.sum(diff**2))
-
-            # Normalize
-            total = np.sum(probs[t])
-            if total > 0:
-                probs[t] /= total
-            else:
-                probs[t] = 1.0 / self.n_states
+        # Softmax normalization (numerically stable)
+        log_probs -= np.max(log_probs, axis=1, keepdims=True)
+        probs = np.exp(log_probs)
+        totals = np.sum(probs, axis=1, keepdims=True)
+        probs = np.where(totals > 0, probs / totals, 1.0 / self.n_states)
 
         return probs

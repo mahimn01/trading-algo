@@ -116,3 +116,15 @@ class AssetState:
     day_high: float = 0.0
     day_low: float = 0.0
     day_volume: float = 0.0
+
+    # Running sums for incremental VWAP (O(1) updates)
+    _cum_tp_vol: float = 0.0
+    _cum_vol: float = 0.0
+
+    # Running ATR state (Wilder smoothing)
+    _atr_count: int = 0
+
+    # Running RSI state (Wilder smoothing)
+    _rsi_avg_gain: float = 0.0
+    _rsi_avg_loss: float = 0.0
+    _rsi_count: int = 0

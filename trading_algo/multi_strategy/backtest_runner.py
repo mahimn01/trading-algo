@@ -12,6 +12,7 @@ Unlike the single-strategy BacktestEngine in backtest_v2, this runner:
 
 from __future__ import annotations
 
+import heapq
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, date
@@ -35,6 +36,10 @@ class MultiStrategyBacktestConfig:
     commission_per_share: float = 0.0035
     slippage_bps: float = 2.0
     risk_free_rate: float = 0.045  # Annual risk-free rate (current ~4.5%)
+    signal_interval_bars: int = 0  # 0 = daily only; 12 = ~hourly on 5-min data
+    intraday_vol_threshold: float = 0.0  # Only intraday signals when ann vol > this (0=always)
+    max_position_pct: float = 0.25  # Max % of equity per symbol
+    max_gross_exposure: float = 1.0  # Max gross exposure
 
 
 @dataclass
@@ -102,10 +107,6 @@ class MultiStrategyBacktestRunner:
         results = runner.run(data)
     """
 
-    # Risk limits
-    MAX_POSITION_PCT = 0.20   # Max 20% of equity per symbol
-    MAX_GROSS_EXPOSURE = 1.0  # Max 100% gross exposure (no leverage)
-
     def __init__(
         self,
         controller: MultiStrategyController,
@@ -113,6 +114,10 @@ class MultiStrategyBacktestRunner:
     ):
         self.controller = controller
         self.config = config or MultiStrategyBacktestConfig()
+
+        # Risk limits (from config)
+        self.MAX_POSITION_PCT = self.config.max_position_pct
+        self.MAX_GROSS_EXPOSURE = self.config.max_gross_exposure
 
         # State
         self._equity = self.config.initial_capital
@@ -149,13 +154,14 @@ class MultiStrategyBacktestRunner:
         symbols = self.config.symbols or list(data.keys())
 
         # Build a unified timeline from all bars
-        all_bars: List[Tuple[datetime, str, Any]] = []
-        for symbol, bars in data.items():
-            for bar in bars:
-                ts = bar.timestamp if hasattr(bar, 'timestamp') else datetime.fromtimestamp(bar.timestamp_epoch_s)
-                all_bars.append((ts, symbol, bar))
+        # Each symbol's bars are already sorted by timestamp — use merge
+        # NOTE: use a helper to avoid closure bug (symbol captured by reference)
+        def _tagged(sym, bars):
+            return ((bar.timestamp, sym, bar) for bar in bars)
 
-        all_bars.sort(key=lambda x: x[0])
+        iterables = [_tagged(sym, bars) for sym, bars in data.items()]
+        all_bars_iter = heapq.merge(*iterables, key=lambda x: x[0])
+        all_bars = list(all_bars_iter)
 
         if not all_bars:
             return self._build_results()
@@ -167,34 +173,54 @@ class MultiStrategyBacktestRunner:
         total = len(all_bars)
         last_day = None
         daily_equity_open = self._equity
-        signalled_today = False
+        bars_since_signal = 0
+        signal_interval = self.config.signal_interval_bars
+        day_count = 0
 
         for i, (ts, symbol, bar) in enumerate(all_bars):
-            o = bar.open if hasattr(bar, 'open') else bar.open_price
+            o = bar.open
             h = bar.high
             l = bar.low
             c = bar.close
-            v = bar.volume if hasattr(bar, 'volume') else 0
+            v = bar.volume
 
             # Feed to controller
             self.controller.update(symbol, ts, o, h, l, c, v)
             self._current_prices[symbol] = c
 
-            # Update position values
-            self._update_equity()
+            # Update position values (only when symbol has an open position)
+            if symbol in self._positions:
+                self._update_equity()
 
             # Track daily boundaries
             current_day = ts.date()
             is_new_day = last_day is not None and current_day != last_day
 
+            # Intraday signal generation at configured interval
+            bars_since_signal += 1
+            if (
+                signal_interval > 0
+                and bars_since_signal >= signal_interval
+                and self._equity > 0
+                and not is_new_day
+                and self._is_high_vol()
+            ):
+                signals = self.controller.generate_signals(
+                    symbols, ts, self._equity
+                )
+                self._process_signals(signals, ts)
+                self._sync_portfolio_state(daily_equity_open)
+                bars_since_signal = 0
+
             if is_new_day:
-                # Generate signals once per day (end-of-day) to avoid
-                # excessive churn from intraday re-sizing
-                if not signalled_today and self._equity > 0:
+                # Generate signals at day boundary for daily strategies
+                if self._equity > 0:
                     signals = self.controller.generate_signals(
                         symbols, ts, self._equity
                     )
                     self._process_signals(signals, ts)
+                    self._sync_portfolio_state(daily_equity_open)
+                    bars_since_signal = 0
 
                 # Record equity and daily return
                 self._equity_curve.append(self._equity)
@@ -208,7 +234,15 @@ class MultiStrategyBacktestRunner:
                 # Reset daily counters
                 self.controller.new_trading_day()
                 daily_equity_open = self._equity
-                signalled_today = False
+
+                # Detect regime every 5 trading days
+                day_count += 1
+                if (
+                    day_count % 5 == 0
+                    and hasattr(self.controller, 'detect_regime')
+                    and self.controller.config.enable_regime_adaptation
+                ):
+                    self.controller.detect_regime()
 
             last_day = current_day
 
@@ -228,6 +262,33 @@ class MultiStrategyBacktestRunner:
             progress_callback(0.95, "Computing metrics...")
 
         return self._build_results()
+
+    def _is_high_vol(self) -> bool:
+        """Check if recent volatility exceeds the intraday threshold."""
+        threshold = self.config.intraday_vol_threshold
+        if threshold <= 0:
+            return True  # No vol gating — always use intraday signals
+        if len(self._daily_returns) < 20:
+            return False  # Not enough data — stay daily-only
+        recent_vol = float(np.std(self._daily_returns[-20:]) * np.sqrt(252))
+        return recent_vol >= threshold
+
+    def _sync_portfolio_state(self, daily_equity_open: float) -> None:
+        """Sync portfolio state back to controller for accurate risk checks."""
+        pos_weights: Dict[str, float] = {}
+        for sym, shares in self._positions.items():
+            px = self._current_prices.get(sym, 0)
+            if self._equity > 0 and px > 0:
+                pos_weights[sym] = (shares * px) / self._equity
+        daily_pnl = (
+            (self._equity / daily_equity_open) - 1
+            if daily_equity_open > 0 else 0.0
+        )
+        self.controller.update_portfolio_state(
+            equity=self._equity,
+            positions=pos_weights,
+            daily_pnl=daily_pnl,
+        )
 
     def _process_signals(
         self, signals: List[StrategySignal], timestamp: datetime
@@ -348,6 +409,9 @@ class MultiStrategyBacktestRunner:
 
     def _update_equity(self) -> None:
         """Recalculate equity from cash + positions."""
+        if not self._positions:
+            self._equity = self._cash
+            return
         pos_value = sum(
             shares * self._current_prices.get(sym, 0)
             for sym, shares in self._positions.items()

@@ -118,16 +118,23 @@ class MomentumStrategyAdapter(TradingStrategy):
 
         signals: List[StrategySignal] = []
         for symbol, ms in mom_signals.items():
-            if ms.position_size <= 0:
+            if ms.position_size == 0:
                 continue  # No position for this symbol
 
-            # Map TrendState to direction
-            if ms.trend in (TrendState.STRONG_UP, TrendState.UP):
-                direction = 1
-            elif ms.trend in (TrendState.STRONG_DOWN, TrendState.DOWN):
+            # Determine direction from position_size sign
+            if ms.position_size < 0:
+                # Short signal
                 direction = -1
+                target_weight = abs(ms.position_size)
             else:
-                continue  # NEUTRAL => skip
+                # Long signal — use trend for direction
+                if ms.trend in (TrendState.STRONG_UP, TrendState.UP):
+                    direction = 1
+                elif ms.trend in (TrendState.STRONG_DOWN, TrendState.DOWN):
+                    direction = -1
+                else:
+                    continue  # NEUTRAL => skip
+                target_weight = ms.position_size
 
             # Confidence from momentum score magnitude
             confidence = min(1.0, abs(ms.momentum_score))
@@ -136,7 +143,7 @@ class MomentumStrategyAdapter(TradingStrategy):
                 strategy_name=self.name,
                 symbol=symbol,
                 direction=direction,
-                target_weight=ms.position_size,
+                target_weight=target_weight,
                 confidence=confidence,
                 entry_price=ms.entry_price,
                 trade_type="momentum",

@@ -165,48 +165,53 @@ class Orchestrator:
             state.day_low = min(state.day_low, low)
             state.day_volume += volume
 
-        # Calculate VWAP
-        if len(state.prices) > 0:
-            typical_prices = [(h + l + c) / 3 for h, l, c in
-                            zip(list(state.highs), list(state.lows), list(state.prices))]
-            volumes_list = list(state.volumes)
-            cum_tp_vol = sum(tp * v for tp, v in zip(typical_prices, volumes_list))
-            cum_vol = sum(volumes_list)
-            state.vwap = cum_tp_vol / cum_vol if cum_vol > 0 else close
+        # --- VWAP (incremental running sum, periodic correction) ---
+        tp = (high + low + close) / 3
+        state._cum_tp_vol += tp * volume
+        state._cum_vol += volume
+        n_bars = len(state.prices)
+        if n_bars >= state.prices.maxlen and n_bars % 50 == 0:
+            # Periodic correction for evicted deque entries
+            h_arr = np.asarray(state.highs)
+            l_arr = np.asarray(state.lows)
+            c_arr = np.asarray(state.prices)
+            v_arr = np.asarray(state.volumes)
+            state._cum_tp_vol = float(np.dot((h_arr + l_arr + c_arr) / 3.0, v_arr))
+            state._cum_vol = float(np.sum(v_arr))
+        state.vwap = state._cum_tp_vol / state._cum_vol if state._cum_vol > 0 else close
 
-        # Calculate ATR
-        if len(state.prices) > 1:
-            trs = []
-            prices = list(state.prices)
-            highs_list = list(state.highs)
-            lows_list = list(state.lows)
-            for i in range(-min(14, len(prices)-1), 0):
-                tr = max(
-                    highs_list[i] - lows_list[i],
-                    abs(highs_list[i] - prices[i-1]),
-                    abs(lows_list[i] - prices[i-1])
-                )
-                trs.append(tr)
-            state.atr = sum(trs) / len(trs) if trs else 0
+        # --- ATR (Wilder smoothing, O(1)) ---
+        if n_bars > 1:
+            prev_c = state.prices[-2]  # Previous close from deque
+            true_range = max(high - low, abs(high - prev_c), abs(low - prev_c))
+            if state._atr_count < 14:
+                state._atr_count += 1
+                state.atr = state.atr + (true_range - state.atr) / state._atr_count
+            else:
+                # Wilder smoothing: ATR = (prev_ATR * 13 + TR) / 14
+                state.atr = (state.atr * 13 + true_range) / 14
             state.atr_pct = state.atr / close if close > 0 else 0
 
-        # Calculate RSI
-        if len(state.prices) > 14:
-            prices = list(state.prices)
-            gains = []
-            losses = []
-            for i in range(-14, 0):
-                change = prices[i] - prices[i-1]
-                if change > 0:
-                    gains.append(change)
-                    losses.append(0)
-                else:
-                    gains.append(0)
-                    losses.append(abs(change))
-            avg_gain = sum(gains) / 14
-            avg_loss = max(sum(losses) / 14, 0.0001)
-            rs = avg_gain / avg_loss
-            state.rsi = 100 - (100 / (1 + rs))
+        # --- RSI (Wilder smoothing, O(1)) ---
+        if n_bars > 1:
+            change = close - state.prices[-2]
+            gain = max(change, 0)
+            loss = max(-change, 0)
+            if state._rsi_count < 14:
+                state._rsi_count += 1
+                state._rsi_avg_gain += (gain - state._rsi_avg_gain) / state._rsi_count
+                state._rsi_avg_loss += (loss - state._rsi_avg_loss) / state._rsi_count
+            else:
+                # Wilder smoothing: avg = (prev_avg * 13 + current) / 14
+                state._rsi_avg_gain = (state._rsi_avg_gain * 13 + gain) / 14
+                state._rsi_avg_loss = (state._rsi_avg_loss * 13 + loss) / 14
+            if state._rsi_avg_loss > 0.0001:
+                rs = state._rsi_avg_gain / state._rsi_avg_loss
+                state.rsi = 100 - (100 / (1 + rs))
+            elif state._rsi_avg_gain > 0:
+                state.rsi = 100.0
+            else:
+                state.rsi = 50.0
 
         # Update edge engines
         self.regime_engine.update(symbol, state)
@@ -215,9 +220,9 @@ class Orchestrator:
 
         if self._quant_edge is not None:
             self._quant_edge.update(symbol, state)
-            # Feed benchmark data to the HMM regime model
-            if symbol == "SPY":
-                spy_prices = np.array(list(state.prices), dtype=np.float64)
+            # Feed benchmark data to the HMM regime model (once per day)
+            if symbol == "SPY" and n_bars % 78 == 0:
+                spy_prices = np.asarray(state.prices, dtype=np.float64)
                 self._quant_edge.update_regime(spy_prices)
 
     # ── Signal generation ─────────────────────────────────────────────
