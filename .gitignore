@@ -22,3 +22,13 @@ logs/
 .idea/
 .vscode/
 data/*.csv
+
+# Data caches
+ibkr_data_cache/
+crypto_data_cache/
+
+# Superset
+.superset/
+
+# Claude
+.claude/
