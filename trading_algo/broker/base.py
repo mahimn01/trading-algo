@@ -116,6 +116,21 @@ class Broker(Protocol):
     ) -> list["NewsHeadline"]: ...
     def get_news_article(self, *, provider_code: str, article_id: str, format: str = "TEXT") -> "NewsArticle": ...
 
+    # Market Scanner (optional, broker-dependent).
+    def scan_market(
+        self,
+        scan_code: str,
+        *,
+        instrument_type: str = "STK",
+        location: str = "STK.US.MAJOR",
+        num_rows: int = 25,
+        above_price: float | None = None,
+        below_price: float | None = None,
+        above_volume: int | None = None,
+        market_cap_above: float | None = None,
+        market_cap_below: float | None = None,
+    ) -> list["ScannerResult"]: ...
+
 
 @dataclass(frozen=True)
 class MarketDataSnapshot:
@@ -202,3 +217,15 @@ class NewsArticle:
     provider_code: str
     article_id: str
     text: str
+
+
+@dataclass(frozen=True)
+class ScannerResult:
+    """A single result from an IBKR market scanner."""
+    instrument: InstrumentSpec
+    rank: int
+    scan_code: str
+    close: float | None = None
+    volume: float | None = None
+    market_cap: float | None = None
+    extra: dict[str, str] | None = None

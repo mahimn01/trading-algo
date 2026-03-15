@@ -37,6 +37,7 @@ from trading_algo.broker.base import (
     OrderRequest,
     OrderResult,
     Position,
+    ScannerResult,
     validate_order_request,
 )
 from trading_algo.config import IBKRConfig
@@ -1412,6 +1413,111 @@ class IBKRBroker:
 
         text = str(getattr(article, "articleText", "") or "")
         return NewsArticle(provider_code=prov, article_id=aid, text=text)
+
+    # -------------------------------------------------------------------------
+    # Market Scanner
+    # -------------------------------------------------------------------------
+
+    def scan_market(
+        self,
+        scan_code: str,
+        *,
+        instrument_type: str = "STK",
+        location: str = "STK.US.MAJOR",
+        num_rows: int = 25,
+        above_price: float | None = None,
+        below_price: float | None = None,
+        above_volume: int | None = None,
+        market_cap_above: float | None = None,
+        market_cap_below: float | None = None,
+    ) -> list[ScannerResult]:
+        """Run an IBKR market scanner and return ranked results.
+
+        Uses reqScannerData (blocking snapshot) via ib_async.ScannerSubscription.
+
+        Args:
+            scan_code: IBKR scan code (e.g. "TOP_PERC_GAIN", "MOST_ACTIVE",
+                "HOT_BY_VOLUME", "HIGH_OPT_IMP_VOLAT", "TOP_PERC_LOSE",
+                "HOT_BY_OPT_VOLUME", "HIGH_DIVIDEND_YIELD_IB").
+            instrument_type: "STK", "FUT", etc.
+            location: Scanner location code (e.g. "STK.US.MAJOR", "STK.US",
+                "STK.NASDAQ", "STK.NYSE").
+            num_rows: Max results (1-50).
+            above_price: Min price filter.
+            below_price: Max price filter.
+            above_volume: Min volume filter.
+            market_cap_above: Min market cap in USD (e.g. 1e9 for $1B).
+            market_cap_below: Max market cap in USD.
+        """
+        _ensure_thread_event_loop()
+
+        if self._ib is None:
+            raise RuntimeError("Broker is not connected")
+
+        num_rows = max(1, min(int(num_rows), 50))
+
+        try:
+            from ib_async import ScannerSubscription
+        except ImportError as exc:
+            raise RuntimeError("ib_async is required for market scanner") from exc
+
+        sub = ScannerSubscription(
+            numberOfRows=num_rows,
+            instrument=str(instrument_type).upper(),
+            locationCode=str(location),
+            scanCode=str(scan_code).upper(),
+        )
+        if above_price is not None:
+            sub.abovePrice = float(above_price)
+        if below_price is not None:
+            sub.belowPrice = float(below_price)
+        if above_volume is not None:
+            sub.aboveVolume = int(above_volume)
+        if market_cap_above is not None:
+            sub.marketCapAbove = float(market_cap_above)
+        if market_cap_below is not None:
+            sub.marketCapBelow = float(market_cap_below)
+
+        if not self._rate_limiter.acquire(timeout=5.0):
+            raise IBKRRateLimitError("Rate limit exceeded for scan_market")
+
+        try:
+            with self._circuit_breaker.protect():
+                scan_data = self._ib.reqScannerData(sub)
+        except Exception as exc:
+            raise RuntimeError(f"Scanner request failed: {exc}") from exc
+
+        results: list[ScannerResult] = []
+        for rank, item in enumerate(scan_data or []):
+            contract = getattr(item, "contractDetails", None)
+            if contract is not None:
+                contract = getattr(contract, "contract", contract)
+
+            if contract is None:
+                continue
+
+            try:
+                instrument = _contract_to_instrument(contract)
+            except Exception:
+                log.debug("Scanner: skipping unrecognized contract %s", contract)
+                continue
+
+            extra: dict[str, str] = {}
+            for key in ("marketName", "longName", "industry", "category", "subcategory"):
+                cd = getattr(item, "contractDetails", None)
+                val = str(getattr(cd, key, "") or "").strip()
+                if val:
+                    extra[key] = val
+
+            results.append(ScannerResult(
+                instrument=instrument,
+                rank=rank,
+                scan_code=str(scan_code).upper(),
+                extra=extra if extra else None,
+            ))
+
+        log.info("Scanner %s returned %d results", scan_code, len(results))
+        return results
 
     # -------------------------------------------------------------------------
     # Paper Trading Verification

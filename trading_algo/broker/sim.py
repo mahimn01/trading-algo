@@ -18,6 +18,7 @@ from trading_algo.broker.base import (
     OrderResult,
     OrderStatus,
     Position,
+    ScannerResult,
     validate_order_request,
 )
 from trading_algo.instruments import InstrumentSpec, validate_instrument
@@ -219,3 +220,20 @@ class SimBroker:
         if not self.connected:
             raise RuntimeError("Broker is not connected")
         return NewsArticle(provider_code=str(provider_code), article_id=str(article_id), text="")
+
+    def scan_market(
+        self,
+        scan_code: str,
+        *,
+        instrument_type: str = "STK",
+        location: str = "STK.US.MAJOR",
+        num_rows: int = 25,
+        above_price: float | None = None,
+        below_price: float | None = None,
+        above_volume: int | None = None,
+        market_cap_above: float | None = None,
+        market_cap_below: float | None = None,
+    ) -> list[ScannerResult]:
+        if not self.connected:
+            raise RuntimeError("Broker is not connected")
+        return []

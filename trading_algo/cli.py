@@ -649,6 +649,38 @@ def _cmd_llm_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_scan(args: argparse.Namespace) -> int:
+    cfg = _apply_cli_overrides(TradingConfig.from_env(), args)
+    broker = _make_broker(args.broker, cfg)
+    broker.connect()
+    try:
+        results = broker.scan_market(
+            args.scan_type,
+            instrument_type=args.instrument_type,
+            location=args.location,
+            num_rows=int(args.max_results),
+            above_price=float(args.min_price) if args.min_price is not None else None,
+            below_price=float(args.max_price) if args.max_price is not None else None,
+            above_volume=int(args.min_volume) if args.min_volume is not None else None,
+            market_cap_above=float(args.min_market_cap) if args.min_market_cap is not None else None,
+            market_cap_below=float(args.max_market_cap) if args.max_market_cap is not None else None,
+        )
+        print(f"results={len(results)} scan={args.scan_type}")
+        for r in results:
+            extra_str = ""
+            if r.extra:
+                name = r.extra.get("longName", "")
+                industry = r.extra.get("industry", "")
+                if name:
+                    extra_str += f" name={name}"
+                if industry:
+                    extra_str += f" industry={industry}"
+            print(f"  #{r.rank}: {r.instrument.symbol} ({r.instrument.kind}){extra_str}")
+        return 0
+    finally:
+        broker.disconnect()
+
+
 def _cmd_chat(args: argparse.Namespace) -> int:
     from trading_algo.llm.chat import main as chat_main
 
@@ -874,6 +906,24 @@ def build_parser() -> argparse.ArgumentParser:
     llm_run.add_argument("--max-ticks", type=int, default=None)
     llm_run.add_argument("--once", action="store_true", help="Run exactly one LLM tick")
     llm_run.set_defaults(func=_cmd_llm_run)
+
+    scan = sub.add_parser("scan", help="Run IBKR market-wide scanner (e.g. top gainers, most active, high options volume)")
+    scan.add_argument("--broker", choices=["ibkr", "sim"], default="ibkr")
+    scan.add_argument("--scan-type", default="MOST_ACTIVE",
+        help="IBKR scan code: MOST_ACTIVE, TOP_PERC_GAIN, TOP_PERC_LOSE, "
+             "HOT_BY_VOLUME, HIGH_OPT_IMP_VOLAT, HOT_BY_OPT_VOLUME, "
+             "HIGH_DIVIDEND_YIELD_IB, TOP_OPEN_PERC_GAIN, TOP_OPEN_PERC_LOSE, "
+             "HIGH_VS_13W_HL, LOW_VS_13W_HL, MOST_ACTIVE_USD, HIGH_SYNTH_BID_REV_NAT")
+    scan.add_argument("--instrument-type", default="STK", help="STK, FUT, IND, etc.")
+    scan.add_argument("--location", default="STK.US.MAJOR",
+        help="Scanner location: STK.US.MAJOR, STK.US, STK.NASDAQ, STK.NYSE, STK.AMEX")
+    scan.add_argument("--max-results", type=int, default=25, help="Max results 1-50")
+    scan.add_argument("--min-price", type=float, default=None, help="Min stock price filter")
+    scan.add_argument("--max-price", type=float, default=None, help="Max stock price filter")
+    scan.add_argument("--min-volume", type=int, default=None, help="Min volume filter")
+    scan.add_argument("--min-market-cap", type=float, default=None, help="Min market cap in USD (e.g. 1000000000 for $1B)")
+    scan.add_argument("--max-market-cap", type=float, default=None, help="Max market cap in USD")
+    scan.set_defaults(func=_cmd_scan)
 
     chat = sub.add_parser("chat", help="Interactive terminal chat (Gemini + OMS tools)")
     chat.add_argument("--broker", choices=["ibkr", "sim"], default=None)
