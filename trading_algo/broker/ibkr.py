@@ -521,6 +521,8 @@ class IBKRBroker:
 
     config: IBKRConfig
     require_paper: bool = True
+    allow_live: bool = False
+    live_confirm_callback: Callable[[str], bool] | None = None
     ib_factory: Callable[[], Any] | None = None
     optimization_config: IBKROptimizationConfig = field(
         default_factory=IBKROptimizationConfig
@@ -622,7 +624,7 @@ class IBKRBroker:
             self._ib = None
             raise IBKRConnectionError(
                 "Failed to connect to IBKR TWS/IB Gateway. Ensure TWS/IBG is running, "
-                "you are logged in to Paper Trading, API access is enabled, and "
+                "you are logged in, API access is enabled, and "
                 "IBKR_PORT matches the configured API port."
             ) from exc
 
@@ -792,6 +794,15 @@ class IBKRBroker:
 
         req = validate_order_request(req)
 
+        self._require_live_confirmation(
+            "PLACE ORDER",
+            f"{req.side} {req.quantity} {req.instrument.kind} {req.instrument.symbol} "
+            f"@ {req.order_type}"
+            f"{f' limit={req.limit_price}' if req.limit_price else ''}"
+            f"{f' stop={req.stop_price}' if req.stop_price else ''}"
+            f" tif={req.tif}",
+        )
+
         # Get qualified contract (uses cache)
         contract = self._get_qualified_contract(req.instrument)
 
@@ -832,6 +843,15 @@ class IBKRBroker:
             raise RuntimeError("Broker is not connected")
 
         new_req = validate_order_request(new_req)
+
+        self._require_live_confirmation(
+            "MODIFY ORDER",
+            f"orderId={order_id} → {new_req.side} {new_req.quantity} "
+            f"{new_req.instrument.kind} {new_req.instrument.symbol} "
+            f"@ {new_req.order_type}"
+            f"{f' limit={new_req.limit_price}' if new_req.limit_price else ''}"
+            f"{f' stop={new_req.stop_price}' if new_req.stop_price else ''}",
+        )
         contract = self._contracts.get(str(order_id))
 
         if contract is None:
@@ -877,6 +897,11 @@ class IBKRBroker:
         trade = self._trades.get(str(order_id)) or _find_trade(self._ib, str(order_id))
         if trade is None:
             raise KeyError(f"Unknown order_id: {order_id}")
+
+        self._require_live_confirmation(
+            "CANCEL ORDER",
+            f"orderId={order_id}",
+        )
 
         if not self._rate_limiter.acquire(timeout=5.0):
             raise IBKRRateLimitError("Rate limit exceeded for cancel_order")
@@ -967,6 +992,13 @@ class IBKRBroker:
 
         if self._ib is None:
             raise RuntimeError("Broker is not connected")
+
+        self._require_live_confirmation(
+            "PLACE BRACKET ORDER",
+            f"{req.side} {req.quantity} {req.instrument.kind} {req.instrument.symbol} "
+            f"entry={req.entry_limit_price} TP={req.take_profit_limit_price} "
+            f"SL={req.stop_loss_stop_price}",
+        )
 
         req_inst = validate_instrument(req.instrument)
         side = req.side.strip().upper()
@@ -1524,7 +1556,7 @@ class IBKRBroker:
     # -------------------------------------------------------------------------
 
     def _assert_paper_trading(self) -> None:
-        """Verify we're connected to a paper trading account."""
+        """Verify we're connected to a paper trading account, or that live is explicitly allowed."""
         if self._ib is None:
             raise RuntimeError("Broker is not connected")
 
@@ -1547,13 +1579,49 @@ class IBKRBroker:
             )
 
         non_paper = [a for a in accounts if not str(a).startswith("DU")]
-        if non_paper:
+        if non_paper and not self.allow_live:
             raise RuntimeError(
                 "Refusing to run because this does not look like Paper Trading. "
                 f"Managed accounts: {accounts}. "
                 "Paper accounts usually start with 'DU'. "
-                "Fix by logging into Paper Trading and using the paper API port."
+                "Fix by logging into Paper Trading and using the paper API port, "
+                "or pass --allow-live to explicitly connect to a live account."
             )
+
+        if non_paper and self.allow_live:
+            log.warning(
+                "*** LIVE ACCOUNT CONNECTION *** Managed accounts: %s. "
+                "All order operations require explicit confirmation.",
+                accounts,
+            )
+
+    def _require_live_confirmation(self, action: str, details: str) -> None:
+        """
+        Gate all mutating operations on live accounts behind explicit user confirmation.
+
+        If connected to a live account (allow_live=True and account is not paper),
+        this method MUST be called before any place/modify/cancel operation.
+        It calls the live_confirm_callback; if the callback returns False or is
+        not set, the operation is refused.
+        """
+        if not self.allow_live:
+            return  # paper account, no extra confirmation needed
+
+        if self.live_confirm_callback is None:
+            raise RuntimeError(
+                f"BLOCKED: {action} on LIVE account requires a confirmation callback. "
+                "No callback is configured — refusing to proceed."
+            )
+
+        if not self.live_confirm_callback(
+            f"\n{'='*60}\n"
+            f"  *** LIVE ACCOUNT ORDER CONFIRMATION ***\n"
+            f"  Action: {action}\n"
+            f"  {details}\n"
+            f"{'='*60}\n"
+            f"Type 'YES' to confirm: "
+        ):
+            raise RuntimeError(f"BLOCKED: {action} was not confirmed by user. Order refused.")
 
 
 # =============================================================================

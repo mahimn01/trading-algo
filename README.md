@@ -27,7 +27,7 @@ randomThings/
 │   │   └── adapters/                # 14 strategy adapters
 │   ├── quant_core/strategies/       # Core strategy implementations
 │   ├── orchestrator/                # Original 6-edge orchestrator
-│   └── broker/                      # IBKR + simulation brokers
+│   └── broker/                      # IBKR + simulation brokers (live account safety guards)
 ├── crypto_alpha/                    # Crypto trading system
 │   ├── edges/                       # 9 crypto-native edge implementations
 │   ├── adapters/                    # Edge → controller adapters
@@ -153,11 +153,46 @@ python crypto_alpha/scripts/fraud_detection.py
 # Paper trading (dry run)
 python run.py --dry-run
 
-# Live with auto-selected stocks
+# Paper trading (live orders on paper account)
 python run.py
+
+# Live account (requires interactive confirmation for every order)
+python run.py --allow-live
 ```
 
 Requires TWS/Gateway running on port 7497 (paper) or 7496 (live).
+
+#### Live Account Safety Guards
+
+The system supports connecting to live IBKR accounts with multiple layers of protection:
+
+| Guard | Description |
+|-------|-------------|
+| **`TRADING_ALLOW_LIVE`** | Env var must be `true` to allow live connections (default: `false`) |
+| **`--allow-live`** | CLI flag must be passed explicitly |
+| **`require_paper`** | Automatically enforced unless `allow_live` is set |
+| **Interactive confirmation** | Every `place_order`, `modify_order`, `cancel_order`, and `place_bracket_order` requires typing `YES` at the prompt |
+| **Callback architecture** | The `live_confirm_callback` is injected via the CLI — no callback means all orders are blocked |
+
+When connected to a live account, every mutating operation displays a confirmation prompt:
+
+```
+============================================================
+  *** LIVE ACCOUNT ORDER CONFIRMATION ***
+  Action: PLACE ORDER
+  BUY 10 STK NVDA @ LIMIT limit=120.00 tif=DAY
+============================================================
+Type 'YES' to confirm:
+```
+
+Environment variables for live trading:
+
+```bash
+TRADING_ALLOW_LIVE=true       # Allow live account connections
+TRADING_LIVE_ENABLED=false    # Additional gate (not required for allow_live)
+TRADING_REQUIRE_PAPER=false   # Disable paper-only enforcement
+IBKR_PORT=7496                # TWS live API port (7497 for paper)
+```
 
 ## Key Learnings
 

@@ -40,11 +40,25 @@ def _load_dotenv_if_present() -> None:
                 os.environ[k] = v
 
 
+def _live_confirm_prompt(message: str) -> bool:
+    """Interactive confirmation prompt for live account operations."""
+    try:
+        response = input(message).strip()
+        return response == "YES"
+    except (EOFError, KeyboardInterrupt):
+        return False
+
+
 def _make_broker(kind: Literal["ibkr", "sim"], cfg: TradingConfig):
     if kind == "sim":
         return SimBroker()
     if kind == "ibkr":
-        return IBKRBroker(cfg.ibkr, require_paper=cfg.require_paper)
+        return IBKRBroker(
+            cfg.ibkr,
+            require_paper=cfg.require_paper,
+            allow_live=cfg.allow_live,
+            live_confirm_callback=_live_confirm_prompt if cfg.allow_live else None,
+        )
     raise ValueError(f"Unsupported broker: {kind}")
 
 
@@ -63,10 +77,13 @@ def _apply_cli_overrides(cfg: TradingConfig, args: argparse.Namespace) -> Tradin
     if getattr(args, "no_dry_run", False):
         dry_run = False
 
+    allow_live = cfg.allow_live or getattr(args, "allow_live", False)
+
     return TradingConfig(
         broker=cfg.broker,
         live_enabled=cfg.live_enabled,
-        require_paper=True,
+        require_paper=not allow_live,
+        allow_live=allow_live,
         dry_run=dry_run,
         order_token=cfg.order_token,
         confirm_token_required=cfg.confirm_token_required,
@@ -721,6 +738,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--dry-run", action="store_true", help="Stage orders only (no sends), overrides TRADING_DRY_RUN")
     p.add_argument("--no-dry-run", action="store_true", help="Allow sending orders, overrides TRADING_DRY_RUN")
+    p.add_argument(
+        "--allow-live", action="store_true",
+        help="Allow connecting to LIVE (non-paper) IBKR accounts. "
+             "All order operations will require interactive YES confirmation.",
+    )
 
     sub = p.add_subparsers(dest="cmd", required=True)
 

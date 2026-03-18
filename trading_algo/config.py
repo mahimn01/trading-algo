@@ -35,6 +35,7 @@ class TradingConfig:
     broker: str = "ibkr"  # "ibkr" | "sim"
     live_enabled: bool = False
     require_paper: bool = True  # forced-on safety rail
+    allow_live: bool = False  # explicit override to connect to live accounts (read + trade)
     dry_run: bool = False
     order_token: str | None = None
     confirm_token_required: bool = False
@@ -49,11 +50,12 @@ class TradingConfig:
             port=_get_env_int("IBKR_PORT", 7497),
             client_id=_get_env_int("IBKR_CLIENT_ID", 7),
         )
+        allow_live = _get_env_bool("TRADING_ALLOW_LIVE", False)
         return TradingConfig(
             broker=_get_env("TRADING_BROKER", "ibkr"),
             live_enabled=_get_env_bool("TRADING_LIVE_ENABLED", False),
-            # Intentionally forced on: paper-only guard should not be disabled by env.
-            require_paper=True,
+            require_paper=not allow_live,
+            allow_live=allow_live,
             dry_run=_get_env_bool("TRADING_DRY_RUN", False),
             order_token=(_get_env("TRADING_ORDER_TOKEN", "").strip() or None),
             confirm_token_required=_get_env_bool("TRADING_CONFIRM_TOKEN_REQUIRED", False),
