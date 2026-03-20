@@ -150,17 +150,30 @@ python crypto_alpha/scripts/fraud_detection.py
 ### Live Trading (IBKR)
 
 ```bash
-# Paper trading (dry run)
+# Paper trading via IB Gateway (port 4002)
+python run.py --paper
+
+# Live account via TWS (port 7496, requires confirmation for every order)
+python run.py --live
+
+# Explicit port override
+python run.py --ibkr-port 7496
+
+# Dry run (stage orders only, no execution)
 python run.py --dry-run
-
-# Paper trading (live orders on paper account)
-python run.py
-
-# Live account (requires interactive confirmation for every order)
-python run.py --allow-live
 ```
 
-Requires TWS/Gateway running on port 7497 (paper) or 7496 (live).
+#### Connection Shortcuts
+
+| Flag | Port | Account | Notes |
+|------|------|---------|-------|
+| `--paper` | 4002 (IB Gateway) | Paper | Default safe mode |
+| `--live` | 7496 (TWS) | Live | Implies `--allow-live`, requires YES confirmation |
+| `--ibkr-port <N>` | Custom | Depends on port | Overrides `--paper`/`--live` |
+
+Both `--paper` and `--live` can run simultaneously on different ports, allowing paper testing and live analysis in parallel.
+
+Requires TWS (live) and/or IB Gateway (paper) running.
 
 #### Live Account Safety Guards
 

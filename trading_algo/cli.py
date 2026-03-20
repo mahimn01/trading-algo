@@ -63,11 +63,23 @@ def _make_broker(kind: Literal["ibkr", "sim"], cfg: TradingConfig):
 
 
 def _apply_cli_overrides(cfg: TradingConfig, args: argparse.Namespace) -> TradingConfig:
+    from .config import IBKR_PORT_GW_PAPER, IBKR_PORT_TWS_LIVE
+
     ibkr = cfg.ibkr
-    if args.ibkr_host is not None or args.ibkr_port is not None or args.ibkr_client_id is not None:
+
+    # Resolve port: explicit --ibkr-port > --paper/--live shortcuts > env/default
+    resolved_port = None
+    if args.ibkr_port is not None:
+        resolved_port = int(args.ibkr_port)
+    elif getattr(args, "paper", False):
+        resolved_port = IBKR_PORT_GW_PAPER
+    elif getattr(args, "live", False):
+        resolved_port = IBKR_PORT_TWS_LIVE
+
+    if resolved_port is not None or args.ibkr_host is not None or args.ibkr_client_id is not None:
         ibkr = type(cfg.ibkr)(
             host=args.ibkr_host or cfg.ibkr.host,
-            port=int(args.ibkr_port or cfg.ibkr.port),
+            port=resolved_port or cfg.ibkr.port,
             client_id=int(args.ibkr_client_id or cfg.ibkr.client_id),
         )
 
@@ -77,7 +89,7 @@ def _apply_cli_overrides(cfg: TradingConfig, args: argparse.Namespace) -> Tradin
     if getattr(args, "no_dry_run", False):
         dry_run = False
 
-    allow_live = cfg.allow_live or getattr(args, "allow_live", False)
+    allow_live = cfg.allow_live or getattr(args, "allow_live", False) or getattr(args, "live", False)
 
     return TradingConfig(
         broker=cfg.broker,
@@ -731,6 +743,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ibkr-host", default=None, help="Override IBKR host (default from env/.env)")
     p.add_argument("--ibkr-port", default=None, help="Override IBKR port (default from env/.env)")
     p.add_argument("--ibkr-client-id", default=None, help="Override IBKR clientId (default from env/.env)")
+    conn_group = p.add_mutually_exclusive_group()
+    conn_group.add_argument(
+        "--paper", action="store_true",
+        help="Connect to IB Gateway paper trading (port 4002).",
+    )
+    conn_group.add_argument(
+        "--live", action="store_true",
+        help="Connect to TWS live account (port 7496). Implies --allow-live.",
+    )
     p.add_argument(
         "--confirm-token",
         default=None,
