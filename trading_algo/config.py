@@ -23,6 +23,12 @@ def _get_env_bool(name: str, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+IBKR_PORT_TWS_LIVE = 7496
+IBKR_PORT_TWS_PAPER = 7497
+IBKR_PORT_GW_LIVE = 4001
+IBKR_PORT_GW_PAPER = 4002
+
+
 @dataclass(frozen=True)
 class IBKRConfig:
     host: str = "127.0.0.1"
