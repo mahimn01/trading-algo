@@ -633,6 +633,73 @@ def _cmd_export_history(args: argparse.Namespace) -> int:
         broker.disconnect()
 
 
+def _cmd_backtest_options(args: argparse.Namespace) -> int:
+    """Backtest Wheel or PMCC strategy using IBKR historical bars."""
+    cfg = _apply_cli_overrides(TradingConfig.from_env(), args)
+
+    from trading_algo.quant_core.strategies.options.options_backtester import (
+        run_options_backtest,
+        print_report,
+    )
+    from trading_algo.quant_core.strategies.options.wheel import WheelStrategy, WheelConfig
+    from trading_algo.quant_core.strategies.options.pmcc import PMCCStrategy, PMCCConfig
+
+    symbols = [s.strip().upper() for s in args.symbols.split(",")]
+    capital = float(args.capital)
+    strategy_name = args.strategy.lower()
+
+    broker = _make_broker("ibkr", cfg)
+    broker.connect()
+
+    try:
+        for symbol in symbols:
+            print(f"\n--- Pulling {args.duration} of daily bars for {symbol} ---")
+            instrument = InstrumentSpec(kind="STK", symbol=symbol, exchange="SMART", currency="USD")
+            bars = broker.get_historical_bars(
+                instrument,
+                duration=args.duration,
+                bar_size="1 day",
+                what_to_show="TRADES",
+                use_rth=True,
+            )
+            print(f"  Got {len(bars)} bars")
+            if len(bars) < 100:
+                print(f"  SKIP: need >= 100 bars, got {len(bars)}")
+                continue
+
+            if strategy_name == "wheel":
+                strat = WheelStrategy(WheelConfig(
+                    initial_capital=capital,
+                    put_delta=float(args.put_delta),
+                    call_delta=float(args.call_delta),
+                    target_dte=int(args.dte),
+                    profit_target=float(args.profit_target),
+                ))
+            elif strategy_name == "pmcc":
+                strat = PMCCStrategy(PMCCConfig(
+                    initial_capital=capital,
+                    leaps_delta=float(args.leaps_delta),
+                    short_delta=float(args.short_delta),
+                    short_dte=int(args.dte),
+                    short_profit_target=float(args.profit_target),
+                ))
+            else:
+                print(f"  Unknown strategy: {strategy_name}")
+                return 1
+
+            report = run_options_backtest(
+                strategy=strat,
+                bars=bars,
+                symbol=symbol,
+                iv_premium_factor=float(args.iv_premium),
+            )
+            print(print_report(report))
+    finally:
+        broker.disconnect()
+
+    return 0
+
+
 def _cmd_llm_run(args: argparse.Namespace) -> int:
     cfg = _apply_cli_overrides(TradingConfig.from_env(), args)
 
@@ -942,6 +1009,20 @@ def build_parser() -> argparse.ArgumentParser:
     exp.add_argument("--max-calls", default="500")
     exp.add_argument("--validate", action="store_true")
     exp.set_defaults(func=_cmd_export_history)
+
+    obt = sub.add_parser("backtest-options", help="Backtest Wheel or PMCC strategy on IBKR historical data")
+    obt.add_argument("--strategy", choices=["wheel", "pmcc"], default="wheel", help="Strategy to backtest")
+    obt.add_argument("--symbols", default="SOFI,F,PLTR", help="Comma-separated symbols")
+    obt.add_argument("--capital", default="10000", help="Initial capital")
+    obt.add_argument("--duration", default="2 Y", help="IBKR duration string (e.g. '1 Y', '2 Y')")
+    obt.add_argument("--dte", default="35", help="Target DTE for short options")
+    obt.add_argument("--put-delta", default="0.30", help="Target put delta (Wheel)")
+    obt.add_argument("--call-delta", default="0.30", help="Target call delta (Wheel/PMCC)")
+    obt.add_argument("--leaps-delta", default="0.80", help="Target LEAPS delta (PMCC)")
+    obt.add_argument("--short-delta", default="0.25", help="Target short call delta (PMCC)")
+    obt.add_argument("--profit-target", default="0.50", help="Close at N%% profit (0.50 = 50%%)")
+    obt.add_argument("--iv-premium", default="1.20", help="IV/RV premium factor for simulation")
+    obt.set_defaults(func=_cmd_backtest_options)
 
     llm_run = sub.add_parser("llm-run", help="Run the LLM trader loop (paper-only enforced)")
     llm_run.add_argument("--broker", choices=["ibkr", "sim"], default="sim")
