@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Trading rules and safety
+    url: https://github.com/mahimn01/ibkr-paper-algo/blob/main/CLAUDE.md
+    about: Project trading rules, paper/live port conventions, risk policy. Read this before opening an issue about live order routing.
