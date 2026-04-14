@@ -777,6 +777,69 @@ def _cmd_scan(args: argparse.Namespace) -> int:
         broker.disconnect()
 
 
+def _cmd_wheel_live(args: argparse.Namespace) -> int:
+    cfg = _apply_cli_overrides(TradingConfig.from_env(), args)
+
+    from trading_algo.quant_core.strategies.options.wheel import WheelConfig
+    from trading_algo.quant_core.strategies.options.live_wheel_adapter import (
+        LiveWheelAdapter,
+        LiveWheelConfig,
+    )
+
+    if args.broker == "ibkr":
+        _assert_ibkr_order_authorized(cfg, args.confirm_token)
+
+    wheel_cfg = WheelConfig(
+        initial_capital=float(args.capital),
+        put_delta=float(args.put_delta),
+        call_delta=float(args.call_delta),
+        target_dte=int(args.dte),
+        profit_target=float(args.profit_target),
+        min_iv_rank=float(args.min_iv_rank),
+    )
+    live_cfg = LiveWheelConfig(
+        symbol=args.symbol.upper(),
+        wheel_config=wheel_cfg,
+        use_lmt_orders=not args.use_mkt,
+        lmt_offset_pct=float(args.lmt_offset_pct),
+        price_history_bars=int(args.history_bars),
+        iv_rv_window=int(args.iv_window),
+    )
+
+    broker = _make_broker(args.broker, cfg)
+    strategy = LiveWheelAdapter(live_cfg)
+    cfg = TradingConfig(
+        broker=args.broker,
+        live_enabled=cfg.live_enabled,
+        require_paper=cfg.require_paper,
+        allow_live=cfg.allow_live,
+        dry_run=cfg.dry_run,
+        order_token=cfg.order_token,
+        confirm_token_required=cfg.confirm_token_required,
+        db_path=cfg.db_path,
+        poll_seconds=int(args.poll_seconds) if args.poll_seconds else cfg.poll_seconds,
+        ibkr=cfg.ibkr,
+    )
+    engine = Engine(
+        broker=broker,
+        config=cfg,
+        strategy=strategy,
+        risk=default_risk_manager(),
+        confirm_token=args.confirm_token,
+    )
+
+    logging.getLogger(__name__).info(
+        "Starting wheel-live: symbol=%s broker=%s dry_run=%s poll=%ss",
+        live_cfg.symbol, args.broker, cfg.dry_run, cfg.poll_seconds,
+    )
+
+    if args.once:
+        engine.run_once()
+    else:
+        engine.run_forever()
+    return 0
+
+
 def _cmd_chat(args: argparse.Namespace) -> int:
     from trading_algo.llm.chat import main as chat_main
 
@@ -1048,6 +1111,23 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument("--min-market-cap", type=float, default=None, help="Min market cap in USD (e.g. 1000000000 for $1B)")
     scan.add_argument("--max-market-cap", type=float, default=None, help="Max market cap in USD")
     scan.set_defaults(func=_cmd_scan)
+
+    wl = sub.add_parser("wheel-live", help="Run Wheel options strategy live via Engine polling loop")
+    wl.add_argument("--broker", choices=["ibkr", "sim"], default="ibkr")
+    wl.add_argument("--symbol", required=True, help="Underlying symbol (e.g. SOFI)")
+    wl.add_argument("--capital", default="10000", help="Initial capital for sizing")
+    wl.add_argument("--put-delta", default="0.30", help="Target put delta")
+    wl.add_argument("--call-delta", default="0.30", help="Target call delta")
+    wl.add_argument("--dte", default="45", help="Target DTE for short options")
+    wl.add_argument("--profit-target", default="0.50", help="Close at N%% profit")
+    wl.add_argument("--min-iv-rank", default="25", help="Minimum IV rank to open")
+    wl.add_argument("--use-mkt", action="store_true", help="Use MKT orders instead of LMT")
+    wl.add_argument("--lmt-offset-pct", default="0.02", help="LMT price offset from theoretical (0.02 = 2%%)")
+    wl.add_argument("--history-bars", default="300", help="Price history bars for IV calc")
+    wl.add_argument("--iv-window", default="30", help="Rolling window for realized vol")
+    wl.add_argument("--poll-seconds", default=None, help="Override poll interval (seconds)")
+    wl.add_argument("--once", action="store_true", help="Run a single tick then exit")
+    wl.set_defaults(func=_cmd_wheel_live)
 
     chat = sub.add_parser("chat", help="Interactive terminal chat (Gemini + OMS tools)")
     chat.add_argument("--broker", choices=["ibkr", "sim"], default=None)
