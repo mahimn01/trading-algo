@@ -26,6 +26,18 @@ data/*.csv
 # Data caches
 ibkr_data_cache/
 crypto_data_cache/
+data/atlas_cache/
+data/atlas_features/
+data/atlas_features_v2/
+data/atlas_features_v3/
+data/atlas_features_v4/
+data/atlas_ibkr/
+data/atlas_memmap/
+data/atlas_r3000/
+data/flex/
+
+# Model checkpoints
+checkpoints/
 
 # Superset
 .superset/
