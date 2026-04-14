@@ -9,19 +9,16 @@ class Time2Vec(nn.Module):
     def __init__(self, d_time: int = 8) -> None:
         super().__init__()
         self.d_time = d_time
-        self.omega = nn.Parameter(torch.randn(d_time))
-        self.phi = nn.Parameter(torch.randn(d_time))
+        self.omega = nn.Parameter(torch.randn(d_time) * 0.1)  # Small init
+        self.phi = nn.Parameter(torch.randn(d_time) * 0.1)
 
     def forward(self, timestamps: Tensor) -> Tensor:
         # timestamps: (B, L)
-        tau = (timestamps - timestamps.mean(dim=-1, keepdim=True)) / (
-            timestamps.std(dim=-1, keepdim=True) + 1e-8
-        )
-        # tau: (B, L) -> (B, L, 1)
-        tau = tau.unsqueeze(-1)
-        # omega, phi: (d_time,) broadcast to (B, L, d_time)
-        raw = self.omega * tau + self.phi
-        # te[0] = linear, te[i>0] = sin(periodic)
+        std = timestamps.std(dim=-1, keepdim=True).clamp(min=1e-4)
+        tau = (timestamps - timestamps.mean(dim=-1, keepdim=True)) / std
+        tau = tau.clamp(-10, 10).unsqueeze(-1)  # (B, L, 1)
+        # Clamp omega/phi to prevent unbounded frequency growth
+        raw = self.omega.clamp(-3, 3) * tau + self.phi.clamp(-3, 3)
         te = torch.cat([raw[..., :1], torch.sin(raw[..., 1:])], dim=-1)
         return te
 

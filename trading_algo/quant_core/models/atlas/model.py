@@ -90,13 +90,16 @@ class ATLASModel(nn.Module):
         )
 
         # Memory bank (registered as buffer — not a parameter)
+        # Xavier-scale init for proper attention magnitude
+        import math
+        mem_scale = 1.0 / math.sqrt(c.d_model)
         self.register_buffer(
             "memory_keys",
-            torch.randn(c.memory_bank_size, c.d_model) * 0.01,
+            torch.randn(c.memory_bank_size, c.d_model) * mem_scale,
         )
         self.register_buffer(
             "memory_values",
-            torch.randn(c.memory_bank_size, c.d_model) * 0.01,
+            torch.randn(c.memory_bank_size, c.d_model) * mem_scale,
         )
 
         # PPO log-std (learnable, not part of the model per se)
@@ -213,7 +216,7 @@ class ATLASModel(nn.Module):
         self, actions_mean: Tensor,
     ) -> torch.distributions.Normal:
         """Create action distribution for PPO (diagonal Gaussian)."""
-        std = torch.clamp(self.log_std.exp(), min=0.05, max=1.0)
+        std = torch.exp(self.log_std.clamp(-3, 1))  # clamp before exp: [e^-3, e^1] ≈ [0.05, 2.7]
         return torch.distributions.Normal(actions_mean, std)
 
     def set_memory_bank(self, keys: Tensor, values: Tensor) -> None:

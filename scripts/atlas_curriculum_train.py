@@ -25,20 +25,24 @@ from trading_algo.quant_core.models.atlas.train_curriculum import (
 )
 from trading_algo.quant_core.models.atlas.train_ppo import load_training_data_v2
 
-CHECKPOINT_DIR = "checkpoints/atlas_curriculum"
-FEATURE_DIR = "data/atlas_features_v2"
+CHECKPOINT_DIR = "checkpoints/atlas_v3_curriculum"
+FEATURE_DIR = "data/atlas_features_v3"
 
 
-def quick_test():
+def quick_test(device: str = "auto"):
     """5 iterations per stage — verify regime differentiation."""
     print("=" * 60)
     print("  ATLAS Curriculum — Quick Test (5 iters/stage)")
     print("=" * 60)
 
+    if device == "auto":
+        device = "mps" if torch.backends.mps.is_available() else "cpu"
+    print(f"Device: {device}", flush=True)
+
     config = ATLASConfig()
     model = ATLASModel(config)
 
-    bc_path = "checkpoints/atlas_v2/atlas_v2_bc_best.pt"
+    bc_path = "checkpoints/atlas_v3/atlas_v3_bc_best.pt"
     if os.path.exists(bc_path):
         ckpt = torch.load(bc_path, map_location="cpu", weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"])
@@ -57,7 +61,7 @@ def quick_test():
         model=model,
         config=config,
         checkpoint_dir=f"{CHECKPOINT_DIR}_test",
-        device="cpu",
+        device=device,
         feature_dir=FEATURE_DIR,
         stages=test_stages,
         rollout_steps=256,
@@ -69,11 +73,15 @@ def quick_test():
     _evaluate_regime_differentiation(model, config)
 
 
-def full_train(from_bc: str | None = None):
+def full_train(from_bc: str | None = None, device: str = "auto"):
     """Full curriculum training: 50+50+50+100 iterations."""
     print("=" * 60)
     print("  ATLAS Curriculum — Full Training (250 iterations)")
     print("=" * 60)
+
+    if device == "auto":
+        device = "mps" if torch.backends.mps.is_available() else "cpu"
+    print(f"Device: {device}", flush=True)
 
     config = ATLASConfig()
     model = ATLASModel(config)
@@ -81,9 +89,9 @@ def full_train(from_bc: str | None = None):
     if from_bc:
         ckpt = torch.load(from_bc, map_location="cpu", weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"])
-        print(f"Loaded BC checkpoint from {from_bc}")
+        print(f"Loaded BC checkpoint from {from_bc} (val_loss={ckpt.get('val_loss', 'N/A')})")
     else:
-        bc_path = "checkpoints/atlas_v2/atlas_v2_bc_best.pt"
+        bc_path = "checkpoints/atlas_v3/atlas_v3_bc_best.pt"
         if os.path.exists(bc_path):
             ckpt = torch.load(bc_path, map_location="cpu", weights_only=False)
             model.load_state_dict(ckpt["model_state_dict"])
@@ -95,7 +103,7 @@ def full_train(from_bc: str | None = None):
         model=model,
         config=config,
         checkpoint_dir=CHECKPOINT_DIR,
-        device="cpu",
+        device=device,
         feature_dir=FEATURE_DIR,
         rollout_steps=512,
     )
@@ -211,12 +219,13 @@ def main():
     parser = argparse.ArgumentParser(description="ATLAS Curriculum Training")
     parser.add_argument("--quick-test", action="store_true", help="5 iters/stage, verify regime differentiation")
     parser.add_argument("--from-bc", type=str, default=None, help="Path to BC checkpoint to start from")
+    parser.add_argument("--device", type=str, default="auto", help="Device: auto, mps, cpu, cuda")
     args = parser.parse_args()
 
     if args.quick_test:
-        quick_test()
+        quick_test(device=args.device)
     else:
-        full_train(from_bc=args.from_bc)
+        full_train(from_bc=args.from_bc, device=args.device)
 
 
 if __name__ == "__main__":

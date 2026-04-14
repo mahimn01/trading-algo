@@ -144,7 +144,7 @@ class OptionsEnvironment:
                     log_rets = np.diff(np.log(np.maximum(window_closes[:30], 1e-8)))
                     rv_30 = float(np.std(log_rets) * np.sqrt(252)) if len(log_rets) > 1 else 0.0
                     ret_20 = (window_closes[min(19, len(window_closes) - 1)] - window_closes[0]) / max(window_closes[0], 1e-8) if len(window_closes) >= 20 else 0.0
-                    if rv_30 > 0.40 or ret_20 < -0.10:
+                    if rv_30 > 0.30 or ret_20 < -0.08:  # broader: was (0.40, -0.10)
                         self._eligible_episodes.append((sym, start))
 
         if not self._eligible_episodes:
@@ -280,6 +280,33 @@ class OptionsEnvironment:
             "features": features, "timestamps": ts, "dow": dow_t, "month": mo_t,
             "is_opex": opex, "is_qtr": qtr, "pre_mu": mu_t, "pre_sigma": sigma_t, "rtg": rtg,
         }
+
+    # ---- crash detection for adaptive stop-loss -----------------------------
+
+    def _is_crash_active(self) -> bool:
+        """Detect crash: extreme realized vol OR sharp drawdown.
+
+        Thresholds are intentionally aggressive to avoid false positives
+        during normal high-IV environments (where positions should hold).
+        RV > 0.55 = ~2 sigma event, ret10 < -0.12 = genuine crash.
+        """
+        t = self._t
+        closes = self._closes
+        # 10-day realized vol (shorter = faster reaction)
+        rv_win = min(10, t)
+        if rv_win >= 5:
+            seg = closes[max(0, t - rv_win): t + 1]
+            lr = np.diff(np.log(np.maximum(seg, 1e-8)))
+            if len(lr) > 1:
+                rv = float(np.std(lr) * np.sqrt(252))
+                if rv > 0.55:
+                    return True
+        # 10-day return (shorter window, stricter threshold)
+        if t >= 10:
+            ret10 = (closes[t] - closes[t - 10]) / max(closes[t - 10], 1e-8)
+            if ret10 < -0.12:
+                return True
+        return False
 
     # ---- equity computation ------------------------------------------------
 
@@ -490,7 +517,20 @@ class OptionsEnvironment:
                     pnl_pct = 0.0
 
                 if self.profit_target > 0.05 and pnl_pct >= self.profit_target:
-                    # Close: buy back the put
+                    # Close: buy back the put at profit
+                    buyback = current_value + _SLIPPAGE_PER_SHARE
+                    self.cash -= buyback * self.position_contracts * 100
+                    commission = _COMMISSION_PER_CONTRACT * self.position_contracts
+                    self.cash -= commission
+                    self.position_type = "none"
+                    self.position_strike = 0.0
+                    self.position_contracts = 0
+                    self.position_entry_premium = 0.0
+                    just_closed = True
+                elif (self.position_entry_premium > 0.01
+                        and current_value >= 3.0 * self.position_entry_premium
+                        and self._is_crash_active()):
+                    # Adaptive stop-loss: only fires during crash conditions (3× rule)
                     buyback = current_value + _SLIPPAGE_PER_SHARE
                     self.cash -= buyback * self.position_contracts * 100
                     commission = _COMMISSION_PER_CONTRACT * self.position_contracts
@@ -537,6 +577,19 @@ class OptionsEnvironment:
                     pnl_pct = 0.0
 
                 if self.profit_target > 0.05 and pnl_pct >= self.profit_target:
+                    buyback = current_value + _SLIPPAGE_PER_SHARE
+                    self.cash -= buyback * self.position_contracts * 100
+                    commission = _COMMISSION_PER_CONTRACT * self.position_contracts
+                    self.cash -= commission
+                    self.position_type = "stock"
+                    self.position_strike = 0.0
+                    self.position_contracts = 0
+                    self.position_entry_premium = 0.0
+                    just_closed = True
+                elif (self.position_entry_premium > 0.01
+                        and current_value >= 3.0 * self.position_entry_premium
+                        and self._is_crash_active()):
+                    # Adaptive stop-loss on short call: only during crashes (3× rule)
                     buyback = current_value + _SLIPPAGE_PER_SHARE
                     self.cash -= buyback * self.position_contracts * 100
                     commission = _COMMISSION_PER_CONTRACT * self.position_contracts
@@ -619,8 +672,30 @@ class OptionsEnvironment:
                 if direction_raw > 0:
                     reward += 0.3
             elif self.reward_shaping == "crash":
-                if delta_raw < 0.10:
-                    reward += 1.0
+                # Real-time crash detection: RV30 and 20-day return
+                _t = self._t
+                _rv = 0.0
+                _rv_win = min(30, _t)
+                if _rv_win >= 5:
+                    _seg = self._closes[max(0, _t - _rv_win): _t + 1]
+                    _lr = np.diff(np.log(np.maximum(_seg, 1e-8)))
+                    if len(_lr) > 1:
+                        _rv = float(np.std(_lr) * np.sqrt(252))
+                _ret20 = 0.0
+                if _t >= 20:
+                    _ret20 = (self._closes[_t] - self._closes[_t - 20]) / max(self._closes[_t - 20], 1e-8)
+                _crash_active = (_rv > 0.30) or (_ret20 < -0.10)
+
+                if _crash_active:
+                    if self.position_type == "none":
+                        reward += 0.5   # flat in crash: positive signal
+                    elif self.position_type in ("short_put", "short_call"):
+                        reward -= 0.5   # holding short premium in crash: penalty
+                    elif self.position_type == "long_call":
+                        reward -= 0.3   # long calls get IV-crushed in crashes
+                else:
+                    if delta_raw < 0.05:
+                        reward += 0.2   # mild bonus for caution when calm
 
         # Clip reward to prevent explosions
         reward = float(np.clip(reward, -5.0, 5.0))

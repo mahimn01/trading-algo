@@ -51,10 +51,10 @@ class DeStationaryModule(nn.Module):
         mu_mean = pre_norm_sigma.mean(dim=-1, keepdim=True)  # (B, L, 1)
 
         cat_tau = torch.cat([sigma_mean, hidden_states], dim=-1)  # (B, L, d+1)
-        tau = torch.exp(self.mlp_tau(cat_tau))  # (B, L, 1), always positive
+        tau = torch.exp(self.mlp_tau(cat_tau).clamp(-3, 3))  # (B, L, 1), bounded [e^-3, e^3] ≈ [0.05, 20]
 
         cat_delta = torch.cat([mu_mean, hidden_states], dim=-1)  # (B, L, d+1)
-        delta = self.mlp_delta(cat_delta)  # (B, L, d_model)
+        delta = self.mlp_delta(cat_delta).clamp(-5, 5)  # (B, L, d_model), bounded bias
 
         return tau, delta
 
@@ -111,25 +111,25 @@ class CausalSelfAttention(nn.Module):
         # Standard QK^T: (B, n_heads, L, L)
         attn_logits = torch.matmul(Q, K.transpose(-2, -1))  # (B, n_heads, L, L)
 
+        # Scale FIRST, then mask (prevents -inf from interacting with scaling)
+        attn_logits = attn_logits / math.sqrt(self.head_dim)
+
         # De-stationary: scale by tau and add delta bias
-        # tau * (Q @ K^T): tau per query position
         attn_logits = tau_expanded * attn_logits
 
-        # delta_last: bias from the last position's delta, broadcast as column
-        # delta: (B, L, d_model) -> take last position -> (B, d_model)
-        # Reshape delta for each head: (B, L, n_heads, head_dim) -> project to scalar per key
-        delta_reshaped = delta.view(B, L, self.n_heads, self.head_dim).transpose(1, 2)  # (B, n_heads, L, head_dim)
-        # delta^T contribution: each query gets the delta bias term
-        # Spec: "+ 1 * delta_last^T" — delta of last position added as bias
-        delta_last = delta_reshaped[:, :, -1:, :]  # (B, n_heads, 1, head_dim)
-        delta_bias = torch.matmul(delta_last, K.transpose(-2, -1))  # (B, n_heads, 1, L)
+        delta_reshaped = delta.view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
+        delta_last = delta_reshaped[:, :, -1:, :]
+        delta_bias = torch.matmul(delta_last, K.transpose(-2, -1))
         attn_logits = attn_logits + delta_bias
 
-        # Add causal mask and scale
-        mask = self.causal_mask[:L, :L]  # (L, L)
-        attn_logits = (attn_logits + mask) / math.sqrt(self.head_dim)
+        # Clamp before mask+softmax to prevent overflow
+        attn_logits = attn_logits.clamp(-50, 50)
 
-        attn_weights = torch.softmax(attn_logits, dim=-1)  # (B, n_heads, L, L)
+        # Add causal mask
+        mask = self.causal_mask[:L, :L]
+        attn_logits = attn_logits + mask
+
+        attn_weights = torch.softmax(attn_logits, dim=-1)
 
         # Attend
         out = torch.matmul(attn_weights, V)  # (B, n_heads, L, head_dim)
@@ -177,7 +177,7 @@ class CrossAttention(nn.Module):
 
         # Q @ K^T: (B, d_model) @ (d_model, M) -> (B, M)
         scale = math.sqrt(self.d_model)
-        alpha = torch.matmul(Q, K.T) / scale  # (B, M)
+        alpha = (torch.matmul(Q, K.T) / scale).clamp(-20, 20)  # (B, M)
         alpha = torch.softmax(alpha, dim=-1)  # (B, M)
 
         # alpha @ V: (B, M) @ (M, d_model) -> (B, d_model)

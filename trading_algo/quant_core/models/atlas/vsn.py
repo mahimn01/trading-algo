@@ -82,9 +82,9 @@ class VariableSelectionNetwork(nn.Module):
             dim=-2,
         )  # (B, L, n_features, d_model)
 
-        # Compute selection weights
+        # Compute selection weights (clamp before softmax to prevent overflow)
         weights = self.selection_grn(x)  # (B, L, n_features)
-        weights = F.softmax(weights, dim=-1)
+        weights = F.softmax(weights.clamp(-20, 20), dim=-1)
 
         # Weighted combination: (B, L, n_features, 1) * (B, L, n_features, d_model)
         selected = (weights.unsqueeze(-1) * processed).sum(dim=-2)  # (B, L, d_model)

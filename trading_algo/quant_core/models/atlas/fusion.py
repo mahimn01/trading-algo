@@ -35,7 +35,7 @@ class ReturnConditionedFusion(nn.Module):
         combined = torch.cat([self_attn_out, cross_attn_out], dim=-1)  # (B, 2d)
         projected = self.project(combined)  # (B, d)
 
-        r_emb = self.return_embed(return_to_go.unsqueeze(-1))  # (B, d)
+        r_emb = self.return_embed(return_to_go.clamp(-5, 5).unsqueeze(-1))  # (B, d)
 
         return self.norm(projected + r_emb)  # (B, d)
 

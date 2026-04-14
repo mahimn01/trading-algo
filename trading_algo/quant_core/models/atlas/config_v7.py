@@ -4,19 +4,19 @@ from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
-class ATLASConfig:
+class ATLASv7Config:
     # Model
-    d_model: int = 64
-    n_mamba_layers: int = 4
+    d_model: int = 128
     n_heads: int = 2
-    d_state: int = 16
-    d_conv: int = 4
-    expand_factor: int = 2
+    head_dim: int = 64
+    n_mlstm_layers: int = 2
+    n_transformer_layers: int = 2
+    patch_size: int = 5
     context_len: int = 90
     n_features: int = 16
     n_time_features: int = 8
     n_calendar_features: int = 10
-    memory_bank_size: int = 10_000
+    n_regimes: int = 4
 
     # Action
     action_dim: int = 5
@@ -59,3 +59,11 @@ class ATLASConfig:
     # Regularization
     dropout: float = 0.1
     risk_free_rate: float = 0.045
+
+    @property
+    def token_dim(self) -> int:
+        return self.n_features + self.n_time_features + self.n_calendar_features
+
+    @property
+    def seq_len(self) -> int:
+        return self.context_len // self.patch_size
