@@ -1,0 +1,5 @@
+# NautilusTrader backtests (trading_algo/nautilus_backtest, scripts/nautilus_backtest.py).
+# Install on top of requirements.txt: .venv/bin/python -m pip install -r requirements-nautilus.txt
+# NautilusTrader 2.0.0rc7 and later need Python 3.13+, and .venv is Python 3.12.
+nautilus_trader==2.0.0rc6
+plotly==7.1.0  # tearsheet.html only

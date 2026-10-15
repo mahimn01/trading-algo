@@ -4,6 +4,27 @@ Complete project history, regenerated from `git log` on 2026-04-14. Every
 commit on `main` (and every commit pending merge) is listed with its author
 date and short SHA.
 
+## 2026-10
+
+### Unreleased — NautilusTrader backtest path
+
+- Added `trading_algo/nautilus_backtest`, which runs the existing
+  `TradingStrategy` adapters, unchanged, through NautilusTrader 2.0.0rc6.
+  Decisions are made at each session's close and fill at the next session's
+  open, priced by the repo's realistic cost model as NautilusTrader fee and
+  fill models.
+- A per-session ledger is reconciled against NautilusTrader's positions and
+  account at every close. Exceptions in strategy callbacks, which
+  NautilusTrader swallows, fail the run.
+- Benchmark statistics against SPY come from NautilusTrader's analysis
+  module, alongside an equal-weight buy-and-hold baseline.
+- A parity check against `MultiStrategyBacktestRunner` agrees trade for trade
+  on single-symbol runs (AAPL 2016-2026: 1,263 trades, max NAV difference
+  4e-7). Multi-symbol runs are reported as not comparable, because the runner
+  generates signals before every symbol's bar has arrived.
+- New CLI `scripts/nautilus_backtest.py`, pinned dependencies in
+  `requirements-nautilus.txt`, and 37 tests.
+
 ## 2026-07
 
 ### Unreleased — IBKR account CLI correctness and lifecycle hardening
